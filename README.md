@@ -2,21 +2,24 @@
 
 OpenMax (CWS) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw) — connects an OpenClaw agent to the OpenMax/CWS workspace over WebSocket.
 
-Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@coco-xyz/cws-agent-sdk`.
+Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@openmaxai/openmax-agent-sdk`.
 
-> **Status: skeleton.** CWS wiring is blocked on the first publish of
-> `@coco-xyz/cws-agent-sdk`. All SDK call sites are marked `TODO(sdk)` in
-> `index.ts`.
+> **Status: implemented against the SDK PR branch** (`@openmaxai/openmax-agent-sdk`,
+> pinned to a commit via a git dependency until the npm release lands — see
+> `package.json`). Pending: real-environment connectivity test (MVP step 5).
 
 ## Architecture
 
 ```
 CWS Server
-    │  WebSocket (auth, heartbeat, reconnect — via @coco-xyz/cws-agent-sdk)
+    │  WebSocket + REST (auth chain, heartbeat, reconnect, /sync catch-up,
+    │  dedupe, access policy — via @openmaxai/openmax-agent-sdk CwsAgentBridge)
     │
 openclaw-openmax (this plugin)
-    │  inbound:  CWS message → access policy → OpenClaw Channel Router → Agent Session
-    │  outbound: agent reply → routeOutboundMessage() → CWS conversation
+    │  inbound:  InboundDelivery.deliver() → group-context/quote/smart-hint blocks
+    │            → OpenClaw Channel Router → Agent Session
+    │            (System Member priority → per-message queue-mode override)
+    │  outbound: agent reply → @mention canonicalization + chunking → bridge.send()
 ```
 
 Same two-layer pattern as [openclaw-hxa-connect](https://github.com/coco-xyz/openclaw-hxa-connect): the SDK owns the protocol/connection, the plugin owns routing and policy.
@@ -42,13 +45,15 @@ Same two-layer pattern as [openclaw-hxa-connect](https://github.com/coco-xyz/ope
      "channels": {
        "openmax": {
          "enabled": true,
-         "serverUrl": "wss://cws.example.com/agent",
+         "coreUrl": "https://cws.example.com",
+         "wsUrl": "wss://cws.example.com/ws",
          "agentToken": "agent_...",
          "agentName": "yourbot",
          "orgId": "your-org-id",
          "access": {
-           "dmPolicy": "open",
-           "groupPolicy": "open"
+           "dmPolicy": "owner",
+           "groupPolicy": "allowlist",
+           "groups": {}
          }
        }
      }

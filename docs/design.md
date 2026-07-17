@@ -103,10 +103,10 @@ OpenClaw 侧事实（源码结论，非猜测）：
 
 ## MVP 五步（对齐方案 §8）
 
-1. ✅ 仓库初始化（本骨架：README / package.json / 插件清单 / index.ts / CI）
-2. CWS 连接 + 鉴权（经 SDK）——阻塞在 SDK 发布
-3. Inbound：CWS 消息 → 策略过滤 → 上下文构建 → OpenClaw 会话
-4. Outbound：agent 回复 → 规范化/分块 → CWS
-5. 双向连通性测试
+1. ✅ 仓库初始化（README / package.json / 插件清单 / index.ts / CI）
+2. ✅ CWS 连接 + 鉴权——经 SDK `CwsAgentBridge`（依赖以 git 引用钉在 SDK PR#1 commit，npm 发版后切换版本号）
+3. ✅ Inbound：SDK 策略过滤 → 群上下文/引用/smart-hint 块 → OpenClaw 会话（含 priority → queueModeOverride 映射、silent 模式只记上下文）
+4. ✅ Outbound：`[SKIP]` 拦截 → @提及规范化 → `splitMessage(3000)` 分块 → bridge.send（parent_id 只挂首块）
+5. ⏳ 双向连通性测试——待真实 CWS 环境（须覆盖：queueModeOverride 生效、owner auto-bind 持久化、断线 /sync 补拉后消息不丢）
 
-MVP 后对齐项：多账户、thread 完整支持、媒体收发、smart mode、agent tools（tm/kb/as）。
+MVP 后对齐项：多账户、thread 完整支持、媒体收发（当前只打 `[image]`/`[file]` 标签不下载）、agent tools（tm/kb/as）、silent 模式语义与 SDK 侧确认。

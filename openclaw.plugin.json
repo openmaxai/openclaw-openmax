@@ -5,17 +5,21 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "serverUrl": {
+      "coreUrl": {
         "type": "string",
-        "description": "CWS server WebSocket URL"
+        "description": "cws-core REST base URL (token exchange + API)"
+      },
+      "wsUrl": {
+        "type": "string",
+        "description": "cws-comm WebSocket base URL (ws-ticket is appended automatically)"
       },
       "agentToken": {
         "type": "string",
-        "description": "Agent token for CWS authentication"
+        "description": "Agent api_key for CWS authentication (exchanged for JWT + ws-ticket)"
       },
       "agentId": {
         "type": "string",
-        "description": "Agent ID on CWS (for self-message filtering)"
+        "description": "Agent member ID on CWS (self-message filtering; auto-filled from token exchange)"
       },
       "agentName": {
         "type": "string",
@@ -24,6 +28,19 @@
       "orgId": {
         "type": "string",
         "description": "CWS organization ID"
+      },
+      "orgName": {
+        "type": "string",
+        "description": "CWS organization display name (optional)"
+      },
+      "contextMessages": {
+        "type": "number",
+        "description": "Group-context history size injected per inbound group message (default 5)"
+      },
+      "urgentQueueMode": {
+        "type": "string",
+        "enum": ["steer", "interrupt"],
+        "description": "How urgent System Member messages enter a busy session: steer (default, inject into the active turn) or interrupt (abort the active run)"
       },
       "access": {
         "type": "object",

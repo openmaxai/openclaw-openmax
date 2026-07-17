@@ -18,5 +18,7 @@
     "websocket"
   ],
   "author": "Coco AI (https://github.com/coco-xyz)",
-  "dependencies": {}
+  "dependencies": {
+    "@openmaxai/openmax-agent-sdk": "github:openmaxai/openmax-agent-sdk#7fc6949440df54aecc5a031ddbc96100e9cd25a2"
+  }
 }

@@ -103,10 +103,10 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 
 ## MVP in five steps (per plan §8)
 
-1. ✅ Repo init (this skeleton: README / package.json / plugin manifest / index.ts / CI)
-2. CWS connection + auth (via SDK) — blocked on SDK publish
-3. Inbound: CWS message → policy filter → context building → OpenClaw session
-4. Outbound: agent reply → canonicalization/chunking → CWS
-5. Bidirectional connectivity test
+1. ✅ Repo init (README / package.json / plugin manifest / index.ts / CI)
+2. ✅ CWS connection + auth — via the SDK `CwsAgentBridge` (dependency pinned as a git ref to the SDK PR#1 commit; switch to a version range once the npm release lands)
+3. ✅ Inbound: SDK policy filter → group-context/quote/smart-hint blocks → OpenClaw session (incl. priority → queueModeOverride mapping; silent mode records context only)
+4. ✅ Outbound: `[SKIP]` interception → mention canonicalization → `splitMessage(3000)` chunking → bridge.send (parent_id on the first chunk only)
+5. ⏳ Bidirectional connectivity test — needs a real CWS environment (must cover: queueModeOverride taking effect, owner auto-bind persistence, no message loss across a disconnect + /sync catch-up)
 
-Post-MVP alignment items: multi-account, full thread support, media send/receive, smart mode, agent tools (tm/kb/as).
+Post-MVP alignment items: multi-account, full thread support, media send/receive (currently label-only `[image]`/`[file]`, no download), agent tools (tm/kb/as), confirming silent-mode semantics with the SDK owner.
