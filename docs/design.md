@@ -56,17 +56,17 @@ openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接）�
 |---|---|---|
 | WS 连接/心跳/指数退避 | SDK | 方案 §2 SDK 职责 |
 | api_key → JWT → ws-ticket 鉴权链 | SDK | 4003 过期只作废 token 缓存，保留 last_seq |
-| seq 持久化 + /sync 断线补拉 | SDK（需确认） | 若 SDK 不管，插件必须自持；开放问题 #1 |
-| 消息去重（TTL 5min） | SDK 或插件 | 随 sync 归属一起定 |
+| seq 持久化 + /sync 断线补拉 | **SDK（已确认）** | SyncEngine + inbox-ledger；游标经 loadSession/saveSession 回调落插件存储 |
+| 消息去重（TTL 5min） | **SDK（已确认）** | inbox-ledger reserve/commit，真实送达才 ack |
 | client_msg_id 幂等 | SDK | |
-| 会话/成员名查询 + 缓存 | 插件 | REST 经 SDK client |
-| DM/群准入策略 + owner 自动绑定 | 插件 | 本文档§群会话 |
-| mention/smart 模式 + `[SKIP]` | 插件 | hxa-connect 已有同款 smart mode 可搬壳 |
+| 会话/成员名查询 + 缓存 | SDK（会话）+ 插件（成员名） | orchestrator 自动 fetch conversation；成员名解析读 `InboundMessage.message` 自行补 |
+| DM/群准入策略 + owner 自动绑定 | **SDK `decideInbound`** + 插件持久化 | decision 随 InboundMessage 下发；auto-bind 经 `onOwnerBind` 回调由插件写 config；群 mode 含 `silent`；同 owner sibling-agent DM 豁免 |
+| mention/smart 模式 + `[SKIP]` | SDK 判定 + 插件执行 | `decision.mode/mentioned` SDK 给出；smartHint 注入与 `[SKIP]` 拦截归插件 |
 | 群上下文 / 引用 / thread 块 | 插件 | |
 | 媒体下载/上传（artifact_id） | 插件 + SDK（as 能力） | Howard 拍板 SDK 含 tm/kb/as CLI |
 | 拒绝通知（含免打扰规则） | 插件 | |
 | System Member priority | 插件 | 映射到 OpenClaw QueueMode，见§System Member priority 承接 |
-| outbound @提及规范化 registry | 插件 | |
+| outbound @提及规范化 registry | 插件（SDK 无） | 建议 SDK 收编（平台级契约）；否则搬 zylos lib/mention.js |
 | markdown 检测 + 3000 分块 | 插件 | OpenClaw `textChunkLimit` 承接一部分 |
 | 多 org（一 org 一 WS，单 org 熔断不连坐） | 插件 multi-account | MVP 单账户；对齐项，MVP 后补（hxa-connect accounts 结构现成） |
 | TM/KB/AS/Comm/Core CLI + 技能层 | SDK 全面范围 | 插件按 hxa-connect `registerTools` 模式注册 agent tools |
@@ -97,7 +97,7 @@ OpenClaw 侧事实（源码结论，非猜测）：
 
 ## 开放问题（阻塞项加粗）
 
-1. **`cws-agent-sdk` 抽取中**（[openmaxai/cws-agent-sdk](https://github.com/openmaxai/cws-agent-sdk)，0.1.0-alpha.0 Phase A）——README 已定界：sync/去重/ack 归 SDK（SyncEngine + inbox-ledger），transport 层（WsClient/TokenManager/CwsHttpClient）已在 PR#1；inbound 走 `InboundDelivery.deliver()` provider（契约即我们的关键不变式）。待与 gavin 确认：① 中立消息 shape 须携带 `sender_type` + `systemEvent.priority`（QueueMode 映射的输入）；② outbound 语义（3000 分块/markdown 检测/client_msg_id/@registry/artifact_id）落 SDK 哪层；③ README 把 access policy 划进 SDK protocol/——若成立，本文档"策略过滤归插件"收缩为"插件配置 SDK 策略"，配置 schema 要对齐 SDK 形状；④ `StorageProvider` 需覆盖 last_seq 与 mention registry 持久化。
+1. **SDK 已评审通过**（[openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) PR#1，全量抽取 +11k 行含 orchestrator/schemas/fixtures）——上一轮 4 个确认点结论：① `InboundMessage` 必带 `senderType`(HUMAN/AGENT/SYSTEM)，`priority`(1/2/3) 作为 `deliver(msg, endpoint, priority)` 第三参传入，QueueMode 映射输入齐了；② outbound：client_msg_id/markdown 检测/`splitMessage(3000)` 均在 SDK（分块需插件自行调用），媒体 `uploadMedia` 返回 artifactId、附件组装归插件；③ access policy 归 SDK `decideInbound`（纯函数），decision（mode/mentioned/groupCfg/bindOwnerHint）随 InboundMessage 下发，群 mode 新增 `silent`，另有同 owner 的 sibling-agent DM 豁免；owner auto-bind 改为 `onOwnerBind` 回调、插件负责持久化；④ last_seq/ledger/dedup/token 持久化全走 StorageProvider + loadSession/saveSession。**唯一缺口：@提及规范化 registry 不在 SDK**（cws-fe 高亮契约是平台级的，四个 adapter 都要）——建议 SDK 收编，否则插件自带（zylos lib/mention.js 112 行可直接搬）。接线仍等 PR 合并 + npm 发版。
 2. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
 3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖；可顺手给 OpenClaw 提 issue/PR 把它提升为插件公开选项。
 

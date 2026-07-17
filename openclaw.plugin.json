@@ -58,8 +58,8 @@
                 },
                 "mode": {
                   "type": "string",
-                  "enum": ["mention", "smart"],
-                  "description": "mention (default: respond only when @-mentioned) or smart (receive all, model decides, [SKIP] to stay silent)"
+                  "enum": ["mention", "smart", "silent"],
+                  "description": "mention (default: respond only when @-mentioned), smart (receive all, model decides, [SKIP] to stay silent), or silent (per SDK access-policy)"
                 }
               }
             }

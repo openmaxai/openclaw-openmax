@@ -19,7 +19,7 @@ function getRuntime(): PluginRuntime {
 interface OpenMaxGroupConfig {
   name?: string;
   allowFrom?: string[];
-  mode?: "mention" | "smart";
+  mode?: "mention" | "smart" | "silent";
 }
 
 interface OpenMaxAccessConfig {

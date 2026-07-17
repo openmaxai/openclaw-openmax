@@ -56,17 +56,17 @@ openclaw-openmax is an OpenClaw channel plugin (Category A protocol bridge). Its
 |---|---|---|
 | WS connect / heartbeat / exponential backoff | SDK | SDK responsibility per plan §2 |
 | api_key → JWT → ws-ticket auth chain | SDK | On 4003 session-expired, invalidate only the token cache; keep last_seq |
-| Seq persistence + /sync reconnect catch-up | SDK (to confirm) | If the SDK doesn't own it, the plugin must; open question #1 |
-| Message dedup (5-min TTL) | SDK or plugin | Decide together with sync ownership |
+| Seq persistence + /sync reconnect catch-up | **SDK (confirmed)** | SyncEngine + inbox-ledger; cursor persisted via loadSession/saveSession callbacks into plugin storage |
+| Message dedup (5-min TTL) | **SDK (confirmed)** | inbox-ledger reserve/commit; ack only on genuine delivery |
 | client_msg_id idempotency | SDK | |
-| Conversation / member-name lookup + cache | Plugin | REST via SDK client |
-| DM/group access policy + owner auto-bind | Plugin | See group-conversation section |
-| mention/smart mode + `[SKIP]` | Plugin | hxa-connect already ships the same smart mode; shell reusable |
+| Conversation / member-name lookup + cache | SDK (conversation) + plugin (member names) | The orchestrator fetches the conversation; member-name resolution reads `InboundMessage.message` in the plugin |
+| DM/group access policy + owner auto-bind | **SDK `decideInbound`** + plugin persistence | Decision rides on InboundMessage; auto-bind persisted by the plugin via `onOwnerBind`; group mode includes `silent`; same-owner sibling-agent DM exemption |
+| mention/smart mode + `[SKIP]` | SDK decides + plugin executes | `decision.mode/mentioned` come from the SDK; smart-hint injection and `[SKIP]` interception stay in the plugin |
 | Group-context / quote / thread blocks | Plugin | |
 | Media download/upload (artifact_id) | Plugin + SDK (as capability) | Howard approved SDK scope incl. tm/kb/as CLIs |
 | Reject notices (incl. do-not-disturb rules) | Plugin | |
 | System Member priority | Plugin | Mapped onto OpenClaw QueueMode — see the System Member priority section |
-| Outbound mention canonicalization registry | Plugin | |
+| Outbound mention canonicalization registry | Plugin (not in SDK) | Suggest the SDK absorbs it (platform-level contract); otherwise port zylos lib/mention.js |
 | Markdown detection + 3000-char chunking | Plugin | OpenClaw `textChunkLimit` covers part of it |
 | Multi-org (one WS per org; one org going terminal doesn't kill the rest) | Plugin multi-account | MVP is single-account; alignment item post-MVP (hxa-connect accounts structure is ready to reuse) |
 | TM/KB/AS/Comm/Core CLIs + skill layer | SDK full scope | Plugin registers agent tools following hxa-connect's `registerTools` pattern |
@@ -97,7 +97,7 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 
 ## Open questions (blockers in bold)
 
-1. **`cws-agent-sdk` extraction in progress** ([openmaxai/cws-agent-sdk](https://github.com/openmaxai/cws-agent-sdk), 0.1.0-alpha.0 Phase A) — the README settles the boundary: sync/dedup/ack belong to the SDK (SyncEngine + inbox-ledger); the transport layer (WsClient/TokenManager/CwsHttpClient) is in PR#1; inbound goes through the `InboundDelivery.deliver()` provider (whose contract is exactly our key invariant). To confirm with gavin: ① the neutral message shape must carry `sender_type` + `systemEvent.priority` (input for our QueueMode mapping); ② where outbound semantics land (3000-char chunking / markdown detection / client_msg_id / mention registry / artifact_id); ③ the README puts access policy inside SDK protocol/ — if so, "policy filtering in plugin" in this doc shrinks to "plugin configures SDK policy" and our config schema must match the SDK shape; ④ `StorageProvider` needs to cover last_seq and mention-registry persistence.
+1. **SDK reviewed and accepted** ([openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) PR#1, full extraction, +11k lines incl. orchestrator/schemas/fixtures) — outcomes of last round's four asks: ① `InboundMessage` requires `senderType` (HUMAN/AGENT/SYSTEM) and carries `priority` (1/2/3) passed as the third arg of `deliver(msg, endpoint, priority)` — our QueueMode mapping input is covered; ② outbound: client_msg_id / markdown detection / `splitMessage(3000)` are all in the SDK (the plugin must call chunking itself); media `uploadMedia` returns artifactId, attachment assembly stays in the plugin; ③ access policy lives in SDK `decideInbound` (pure function), the decision (mode/mentioned/groupCfg/bindOwnerHint) rides on the InboundMessage, group mode gains `silent`, plus a same-owner sibling-agent DM exemption; owner auto-bind became the `onOwnerBind` callback with the plugin persisting it; ④ last_seq / ledger / dedup / token persistence all go through StorageProvider + loadSession/saveSession. **Only gap: the outbound mention-canonicalization registry is not in the SDK** (the cws-fe highlight contract is platform-level; all four adapters need it) — suggest the SDK absorbs it, otherwise the plugin ports zylos lib/mention.js (112 lines). Wiring still waits on PR merge + npm publish.
 2. Repo home github.com/coco-xyz/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
 3. `queueModeOverride` is an OpenClaw-internal type field (works at runtime): the connectivity test must cover it; consider filing an OpenClaw issue/PR to promote it to a public plugin option.
 
