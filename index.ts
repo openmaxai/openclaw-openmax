@@ -17,6 +17,7 @@ import {
   CwsAgentBridge,
   CwsHttpClient,
   TokenManager,
+  createMentionRegistry,
   parseEndpoint,
   splitMessage,
 } from "@openmaxai/openmax-agent-sdk";
@@ -124,60 +125,34 @@ function fileStorage(file: string) {
 }
 
 // ─── Outbound @mention canonicalization ──────────────────────
-// Ported from zylos-openmax lib/mention.js (not yet in the SDK — flagged to be
-// absorbed there). cws-fe highlights mentions purely by matching the literal
-// text `@<exact display_name>` of a conversation participant, so we record the
-// names we see inbound and canonicalize `@name` tokens on the way out.
-const MAX_NAMES_PER_CONV = 200;
-const MAX_TRACKED_CONVS = 500;
-const normName = (s: unknown) => String(s ?? "").trim().toLowerCase();
-
-function mentionRegistryPath(): string {
-  return path.join(getDataDir(), "mention-registry.json");
+// SDK createMentionRegistry (absorbed there per issue #8): records the display
+// names seen inbound and canonicalizes `@name` tokens on outbound so cws-fe's
+// literal-display-name matcher highlights them. Backed by the plugin's kv store.
+let _mentionRegistry: any = null;
+function getMentionRegistry(): any {
+  if (!_mentionRegistry) {
+    _mentionRegistry = createMentionRegistry({
+      storage: fileStorage(path.join(getDataDir(), "kv.json")),
+      log: (...a: any[]) => console.log("[openmax]", ...a),
+    });
+  }
+  return _mentionRegistry;
 }
 
-function recordParticipants(conversationId: string, names: Array<string | undefined>): void {
-  if (!conversationId) return;
-  const list = names.map((n) => String(n ?? "").trim()).filter(Boolean);
-  if (!list.length) return;
-  const file = mentionRegistryPath();
-  const reg = readJson(file) || {};
-  const conv = reg[conversationId] || (reg[conversationId] = {});
-  let changed = false;
-  for (const name of list) {
-    const key = normName(name);
-    if (conv[key] !== name) {
-      conv[key] = name;
-      changed = true;
-    }
+async function recordParticipants(conversationId: string, names: Array<string | undefined>): Promise<void> {
+  try {
+    await getMentionRegistry().recordParticipants(conversationId, names.filter(Boolean) as string[]);
+  } catch {
+    /* best-effort: registry failures must never break message handling */
   }
-  if (!changed) return;
-  const keys = Object.keys(conv);
-  if (keys.length > MAX_NAMES_PER_CONV) {
-    for (const k of keys.slice(0, keys.length - MAX_NAMES_PER_CONV)) delete conv[k];
-  }
-  // Also bound the number of tracked conversations (drop oldest insertion).
-  const convIds = Object.keys(reg);
-  if (convIds.length > MAX_TRACKED_CONVS) {
-    for (const id of convIds.slice(0, convIds.length - MAX_TRACKED_CONVS)) delete reg[id];
-  }
-  writeJson(file, reg);
 }
 
-function resolveMentions(text: string, conversationId: string): string {
-  if (!text || !conversationId || !text.includes("@")) return text;
-  const conv = (readJson(mentionRegistryPath()) || {})[conversationId];
-  if (!conv) return text;
-  // Longest name first so "Alice Wong" wins over "Alice".
-  const names = (Object.values(conv) as string[]).sort((a, b) => b.length - a.length);
-  let out = text;
-  for (const name of names) {
-    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // Replacer function: a display name containing `$&`/`$'` must not expand
-    // as a replacement pattern and splice message text into the output.
-    out = out.replace(new RegExp("@" + esc, "gi"), () => "@" + name);
+async function resolveMentions(text: string, conversationId: string): Promise<string> {
+  try {
+    return await getMentionRegistry().resolveMentions(text, conversationId);
+  } catch {
+    return text;
   }
-  return out;
 }
 
 // ─── Inbound context building (aligned with zylos formatInboundForC4) ────────
@@ -477,7 +452,7 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   const senderName = msg.senderDisplayName || msg.senderId || "unknown";
 
   // Record participant names for outbound @mention canonicalization.
-  recordParticipants(msg.conversationId, [senderName]);
+  void recordParticipants(msg.conversationId, [senderName]);
 
   // mode=silent: consume without waking the agent — only the sender name (already
   // recorded above) is captured; history is re-fetched from CWS on the next
@@ -495,7 +470,7 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
       fetchGroupContext(st, msg.orgId, msg.conversationId, msg.seq, acct.contextMessages ?? DEFAULT_CONTEXT_MESSAGES),
       [],
     );
-    recordParticipants(msg.conversationId, blocks.groupContext.map((m) => m.senderName));
+    void recordParticipants(msg.conversationId, blocks.groupContext.map((m) => m.senderName));
   }
   if (msg.parentMessageId && msg.conversationType !== "thread") {
     blocks.quoted = await withTimeout(
@@ -628,7 +603,7 @@ async function sendOutbound(
   // A thread is its own conversation — send into it; else the parent conversation.
   const conversationId = ep.threadConversationId || ep.conversationId;
   const replyTo = opts.replyTo || ep.replyTo || ep.parentMessageId;
-  const canonical = resolveMentions(text, conversationId);
+  const canonical = await resolveMentions(text, conversationId);
   const chunks: string[] = splitMessage(canonical);
   let firstId = "";
   for (let i = 0; i < chunks.length; i++) {
@@ -730,50 +705,10 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
       inbound: { deliver: deliverInbound },
     },
     callbacks: {
-      // Session-cursor recovery: the SDK persists the ledger watermark
-      // (kv.json, on every record) but only writes sync_seq on the periodic
-      // ack tick, and bridge.stop() doesn't flush it — so a restart shortly
-      // after a delivery finds no cursor and the SDK's first-connect
-      // seek-to-inbox-end SKIPS messages that arrived while we were down
-      // (observed live: owner's message lost across the owner-bind config
-      // restart). Seed the cursor from the ledger's acked_seq. NOTE: the
-      // `inbox-<slug>.json` storage key is SDK-internal — remove this once the
-      // SDK flushes the cursor on stop (reported upstream).
-      loadSession: (slug: string) => {
-        const session = readJson(sessionFile(slug)) || {};
-        let acked = 0;
-        try {
-          const kv = readJson(path.join(dataDir, "kv.json")) || {};
-          const raw = kv[`inbox-${slug}.json`];
-          if (raw === undefined) {
-            // Drift guard: ledger state should exist after the first delivery;
-            // its absence alongside a missing cursor means either a genuine
-            // first connect or the SDK's internal storage key changed.
-            if (!session.sync_seq && Object.keys(kv).length > 0) {
-              console.warn(`[openmax] no session cursor and no inbox-ledger key for ${slug} — first connect, or SDK ledger key drifted`);
-            }
-          } else {
-            const ledger = JSON.parse(raw || "null");
-            if (typeof ledger?.acked_seq === "number" && ledger.acked_seq > 0) acked = ledger.acked_seq;
-          }
-        } catch {
-          /* corrupt ledger state — treat as absent */
-        }
-        if (acked > 0 && !session.sync_seq) {
-          console.log(`[openmax] seeding sync_seq=${acked} from inbox-ledger watermark`);
-          return { ...session, sync_seq: acked };
-        }
-        if (acked > 0 && session.sync_seq > acked) {
-          // The sync cursor can overrun the delivery watermark (a /sync sweep
-          // skips a message whose live delivery is in flight and later fails).
-          // acked_seq only advances on genuine delivery, so clamping down is
-          // always safe — replayed already-delivered seqs are deduped by the
-          // ledger.
-          console.log(`[openmax] clamping sync_seq ${session.sync_seq} → inbox-ledger watermark ${acked}`);
-          return { ...session, sync_seq: acked };
-        }
-        return session;
-      },
+      // Cursor recovery lives in the SDK now (issues #4/#5: the orchestrator
+      // seeds/clamps sync_seq from the ledger's durable acked_seq, and gap
+      // sweeps floor at the watermark) — the plugin just persists the session.
+      loadSession: (slug: string) => readJson(sessionFile(slug)) || {},
       saveSession: (slug: string, partial: any) => {
         writeJson(sessionFile(slug), { ...(readJson(sessionFile(slug)) || {}), ...partial });
       },
