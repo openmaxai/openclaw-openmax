@@ -12,9 +12,10 @@ import path from "path";
 // agent replies back through bridge.send(). Behavioral semantics are aligned
 // with zylos-openmax — see docs/design.md.
 import {
+  AsService,
+  CwsAgentBridge,
   CwsHttpClient,
   TokenManager,
-  CwsAgentBridge,
   splitMessage,
 } from "@openmaxai/openmax-agent-sdk";
 
@@ -196,7 +197,7 @@ When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
 
 interface ContextBlocks {
   groupContext?: Array<{ senderName: string; content: string }>;
-  quoted?: { sender: string; text: string };
+  quoted?: { sender: string; text: string; attachments?: any[] };
   smartHint?: boolean;
 }
 
@@ -248,10 +249,62 @@ export function isSkipReply(text: string): boolean {
   return text.trim() === "[SKIP]";
 }
 
+// ─── Inbound media (attachments → local files the model can see) ─────────────
+// OpenClaw feeds images to the model via ctx.MediaPaths — LOCAL file paths that
+// must live under its allowed media roots; a path mentioned in the body text is
+// never read. Files are saved through core.channel.media.saveMediaBuffer so
+// they land in an allowed root (<configDir>/media/inbound) and are covered by
+// the gateway's media TTL cleanup.
+const MEDIA_MAX_BYTES = 10 * 1024 * 1024; // OpenClaw's inline-image cap per agent turn
+const MEDIA_FETCH_TIMEOUT_MS = 30_000;
+
+interface DownloadedMedia {
+  path: string;
+  mime: string;
+}
+
+async function downloadAttachments(st: BridgeState, core: any, attachments: any[]): Promise<DownloadedMedia[]> {
+  const out: DownloadedMedia[] = [];
+  for (const att of attachments || []) {
+    const artifactId = att?.artifact_id; // NOT media_id — /artifacts/resolve only accepts artifact ids
+    if (!artifactId) continue;
+    if (att.size_bytes && att.size_bytes > MEDIA_MAX_BYTES) {
+      console.warn(`[openmax] attachment ${att.file_name || artifactId} exceeds ${MEDIA_MAX_BYTES}B, label only`);
+      continue;
+    }
+    try {
+      const media = await withTimeout<DownloadedMedia | null>(
+        (async () => {
+          const { url, contentType } = await st.as.getMediaUrl(artifactId);
+          if (!url) return null;
+          const buf = await st.http.getBytes(url);
+          const saved = await core.channel.media.saveMediaBuffer(
+            buf,
+            att.content_type || contentType || "",
+            "inbound",
+            MEDIA_MAX_BYTES,
+            att.file_name,
+          );
+          return saved?.path ? { path: saved.path, mime: saved.contentType || att.content_type || "" } : null;
+        })(),
+        null,
+        MEDIA_FETCH_TIMEOUT_MS,
+      );
+      if (media) out.push(media);
+    } catch (err: any) {
+      // Degrade to the [image]/[file] label — a failed download must never
+      // block message delivery.
+      console.warn(`[openmax] attachment download failed (${att.file_name || artifactId}): ${err?.message}`);
+    }
+  }
+  return out;
+}
+
 // ─── Bridge state ────────────────────────────────────────────
 interface BridgeState {
   bridge: any;
   http: any;
+  as: any;
   orgConfig: any;
   memberNames: Map<string, string>;
 }
@@ -339,22 +392,29 @@ async function fetchQuoted(
   orgId: string,
   conversationId: string,
   messageId: string,
-): Promise<{ sender: string; text: string } | undefined> {
+): Promise<{ sender: string; text: string; attachments: any[] } | undefined> {
   try {
     const q = await st.http.getForOrg(
       orgId,
       st.http.apiPath(`/conversations/${conversationId}/messages/${messageId}`),
     );
-    const text =
-      q?.content?.body?.text ||
+    const structured = q?.content && typeof q.content === "object" ? q.content : {};
+    let text =
+      structured.body?.text ||
       (typeof q?.message?.content === "string" ? q.message.content : "") ||
       q?.message?.fallback_text ||
       "";
+    const attachments: any[] = Array.isArray(structured.attachments) ? structured.attachments : [];
+    // A caption-less quoted image/file would otherwise drop the whole quote.
+    if (!text && attachments.length > 0) {
+      const qType = (q?.message?.type || "").toLowerCase();
+      text = labelMedia("", qType, attachments);
+    }
     if (!text) return undefined;
     const senderId = q?.message?.sender_id;
     const sender =
       q?.message?.sender_display_name || (await resolveMemberName(st, orgId, senderId)) || String(senderId || "unknown");
-    return { sender, text };
+    return { sender, text, attachments };
   } catch {
     return undefined;
   }
@@ -415,6 +475,13 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   const rawText = labelMedia(escapeXml(msg.text || ""), msg.type || "", msg.attachments || []);
   const content = buildInboundBody(rawText, blocks);
 
+  // Download inbound media (current message + quoted) so the vision model can
+  // actually see it — the [image] label in the body is only a caption.
+  const media = await downloadAttachments(st, core, msg.attachments || []);
+  if (blocks.quoted?.attachments?.length) {
+    media.push(...(await downloadAttachments(st, core, blocks.quoted.attachments)));
+  }
+
   const from = `openmax:${msg.senderId || "unknown"}`;
   const to = `openmax:${ACCOUNT_ID}`;
 
@@ -460,6 +527,18 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
     OriginatingChannel: "openmax" as const,
     OriginatingTo: to,
     ConversationLabel: isDm ? senderName : groupName || msg.conversationId,
+    // MediaPaths is how OpenClaw feeds images to the model (collected per turn,
+    // image/* entries are inlined as base64). MediaUrls falls back to the local
+    // path by core convention; the single-value fields serve legacy consumers.
+    ...(media.length > 0
+      ? {
+          MediaPaths: media.map((m) => m.path),
+          MediaUrls: media.map((m) => m.path),
+          MediaTypes: media.map((m) => m.mime),
+          MediaPath: media[0].path,
+          MediaType: media[0].mime,
+        }
+      : {}),
   });
 
   // Priority is read from message metadata, which a non-system sender could
@@ -626,19 +705,39 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
       // `inbox-<slug>.json` storage key is SDK-internal — remove this once the
       // SDK flushes the cursor on stop (reported upstream).
       loadSession: (slug: string) => {
-        const session = readJson(sessionFile(slug));
-        if (session?.sync_seq) return session;
+        const session = readJson(sessionFile(slug)) || {};
+        let acked = 0;
         try {
           const kv = readJson(path.join(dataDir, "kv.json")) || {};
-          const ledger = JSON.parse(kv[`inbox-${slug}.json`] || "null");
-          if (ledger?.acked_seq > 0) {
-            console.log(`[openmax] seeding sync_seq=${ledger.acked_seq} from inbox-ledger watermark`);
-            return { ...(session || {}), sync_seq: ledger.acked_seq };
+          const raw = kv[`inbox-${slug}.json`];
+          if (raw === undefined) {
+            // Drift guard: ledger state should exist after the first delivery;
+            // its absence alongside a missing cursor means either a genuine
+            // first connect or the SDK's internal storage key changed.
+            if (!session.sync_seq && Object.keys(kv).length > 0) {
+              console.warn(`[openmax] no session cursor and no inbox-ledger key for ${slug} — first connect, or SDK ledger key drifted`);
+            }
+          } else {
+            const ledger = JSON.parse(raw || "null");
+            if (typeof ledger?.acked_seq === "number" && ledger.acked_seq > 0) acked = ledger.acked_seq;
           }
         } catch {
-          /* no ledger state — genuine first connect */
+          /* corrupt ledger state — treat as absent */
         }
-        return session || {};
+        if (acked > 0 && !session.sync_seq) {
+          console.log(`[openmax] seeding sync_seq=${acked} from inbox-ledger watermark`);
+          return { ...session, sync_seq: acked };
+        }
+        if (acked > 0 && session.sync_seq > acked) {
+          // The sync cursor can overrun the delivery watermark (a /sync sweep
+          // skips a message whose live delivery is in flight and later fails).
+          // acked_seq only advances on genuine delivery, so clamping down is
+          // always safe — replayed already-delivered seqs are deduped by the
+          // ledger.
+          console.log(`[openmax] clamping sync_seq ${session.sync_seq} → inbox-ledger watermark ${acked}`);
+          return { ...session, sync_seq: acked };
+        }
+        return session;
       },
       saveSession: (slug: string, partial: any) => {
         writeJson(sessionFile(slug), { ...(readJson(sessionFile(slug)) || {}), ...partial });
@@ -679,7 +778,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
 
   // state must be live before start(): inbound frames can arrive as soon as the
   // WS opens, and deliverInbound reads the module singleton.
-  const st: BridgeState = { bridge, http, orgConfig, memberNames: new Map() };
+  const st: BridgeState = { bridge, http, as: new AsService(http), orgConfig, memberNames: new Map() };
   state = st;
   try {
     await bridge.start();
