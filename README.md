@@ -29,7 +29,7 @@ Same two-layer pattern as [openclaw-hxa-connect](https://github.com/coco-xyz/ope
 1. Clone into your OpenClaw extensions directory:
    ```bash
    cd ~/.openclaw/extensions
-   git clone https://github.com/coco-xyz/openclaw-openmax.git openmax
+   git clone https://github.com/openmaxai/openclaw-openmax.git openmax
    cd openmax
    npm install
    ```

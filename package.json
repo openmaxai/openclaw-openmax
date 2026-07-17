@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/coco-xyz/openclaw-openmax.git"
+    "url": "https://github.com/openmaxai/openclaw-openmax.git"
   },
   "keywords": [
     "openclaw",
