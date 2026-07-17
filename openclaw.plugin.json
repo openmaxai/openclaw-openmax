@@ -1,0 +1,54 @@
+{
+  "id": "openclaw-openmax",
+  "channels": ["openmax"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": {
+        "type": "string",
+        "description": "CWS server WebSocket URL"
+      },
+      "agentToken": {
+        "type": "string",
+        "description": "Agent token for CWS authentication"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Agent ID on CWS (for self-message filtering)"
+      },
+      "agentName": {
+        "type": "string",
+        "description": "Agent display name on CWS (used for @mention detection)"
+      },
+      "orgId": {
+        "type": "string",
+        "description": "CWS organization ID"
+      },
+      "access": {
+        "type": "object",
+        "description": "Access control settings",
+        "properties": {
+          "dmPolicy": {
+            "type": "string",
+            "enum": ["open", "allowlist"],
+            "description": "DM policy: open (anyone) or allowlist (only dmAllowFrom)"
+          },
+          "dmAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Allowed DM senders (when dmPolicy=allowlist)"
+          },
+          "groupPolicy": {
+            "type": "string",
+            "enum": ["open", "allowlist", "disabled"],
+            "description": "Group conversation access policy"
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "agentToken": { "label": "Agent Token", "sensitive": true }
+  }
+}
