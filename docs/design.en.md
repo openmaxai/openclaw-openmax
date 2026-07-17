@@ -65,11 +65,31 @@ openclaw-openmax is an OpenClaw channel plugin (Category A protocol bridge). Its
 | Group-context / quote / thread blocks | Plugin | |
 | Media download/upload (artifact_id) | Plugin + SDK (as capability) | Howard approved SDK scope incl. tm/kb/as CLIs |
 | Reject notices (incl. do-not-disturb rules) | Plugin | |
-| System Member priority | Plugin | Whether OpenClaw sessions accept a priority concept: to investigate |
+| System Member priority | Plugin | Mapped onto OpenClaw QueueMode — see the System Member priority section |
 | Outbound mention canonicalization registry | Plugin | |
 | Markdown detection + 3000-char chunking | Plugin | OpenClaw `textChunkLimit` covers part of it |
 | Multi-org (one WS per org; one org going terminal doesn't kill the rest) | Plugin multi-account | MVP is single-account; alignment item post-MVP (hxa-connect accounts structure is ready to reuse) |
 | TM/KB/AS/Comm/Core CLIs + skill layer | SDK full scope | Plugin registers agent tools following hxa-connect's `registerTools` pattern |
+
+## System Member priority handling (from OpenClaw source exploration)
+
+zylos-side semantics: messages from SYSTEM senders carry a priority (urgent/high/normal), mapped to c4-receive's 1/2/3 scale so platform signals (e.g. "approval unblocked") are **processed ahead of normal chat** — it affects queue ordering only; it never interrupts in-flight work.
+
+OpenClaw-side facts (from source, not guesses):
+
+- **No per-message priority queue.** The internal command queue does have foreground(1)/normal(0)/background(-1) levels, but they are derived from the run trigger (`user`/`manual` → foreground, `cron`/`heartbeat` → background); all channel inbound messages are trigger=`user`, and plugins cannot adjust the level per message (`resolveEmbeddedRunSessionQueuePriority`, lane-runtime.ts).
+- The real mechanism is **QueueMode** (`src/auto-reply/reply/queue/`): it decides what happens to a new message while the agent is mid-run. Four modes — `steer` (**default**: inject into the active turn, the message immediately enters the agent's visible context) / `followup` (queue until the current run finishes) / `collect` (coalesce/buffer) / `interrupt` (clear the session lane + abort the active run, handle immediately). Resolution order: inlineMode (per message) > persisted session setting > per-channel config > global config > default `steer`.
+- **Per-message override hook**: `replyOptions.queueModeOverride`. From the plugin's `dispatchReplyWithBufferedBlockDispatcher` call, replyOptions passes through the whole chain verbatim, and `dispatchFromConfig`'s signature is the Internal type that includes this field, so it takes effect at runtime. **Caveat**: the field is declared on `InternalReplySessionOptions` (get-reply.types.ts), not on the public plugin-boundary type — "works at runtime, not promised by the type surface". Pin the behavior with the connectivity test and watch OpenClaw upgrades.
+
+**Adopted mapping**:
+
+| SYSTEM priority | Plugin action | Effect |
+|---|---|---|
+| normal / absent | No override | Respect the operator-configured QueueMode |
+| high | `queueModeOverride: "steer"` | Even if the channel is configured followup/collect (e.g. to avoid disturbing long tasks), platform signals still enter the current turn's context immediately |
+| urgent | `queueModeOverride: "steer"` (default); `"interrupt"` behind a config flag | interrupt aborts the in-flight run — more aggressive than zylos's "jump the queue" semantics, so killing work is off by default and left as a config option |
+
+Since the default QueueMode is already steer, platform signals are naturally unblocked in the idle/default case; this mapping is a backstop for when the operator has changed the queue policy. zylos-style queue-jumping (front insertion into the followup queue) exists inside OpenClaw (`EnqueueFollowupRunOptions.position: "front"`) but is not exposed to plugins — we don't rely on it.
 
 ## Key invariant (from plan §4/§6)
 
@@ -78,8 +98,8 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 ## Open questions (blockers in bold)
 
 1. **`cws-agent-sdk` API shape undecided** — especially whether seq persistence, /sync catch-up, and dedup live in the SDK or the plugin; align once gavin's interface lands. All `TODO(sdk)` markers in the plugin are the wiring points.
-2. How System Member priority maps onto OpenClaw sessions (does OpenClaw have a message-priority concept).
-3. Repo home github.com/coco-xyz/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
+2. Repo home github.com/coco-xyz/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
+3. `queueModeOverride` is an OpenClaw-internal type field (works at runtime): the connectivity test must cover it; consider filing an OpenClaw issue/PR to promote it to a public plugin option.
 
 ## MVP in five steps (per plan §8)
 

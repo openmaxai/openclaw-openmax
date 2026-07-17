@@ -65,11 +65,31 @@ openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接）�
 | 群上下文 / 引用 / thread 块 | 插件 | |
 | 媒体下载/上传（artifact_id） | 插件 + SDK（as 能力） | Howard 拍板 SDK 含 tm/kb/as CLI |
 | 拒绝通知（含免打扰规则） | 插件 | |
-| System Member priority | 插件 | OpenClaw 侧有无优先级承接待查 |
+| System Member priority | 插件 | 映射到 OpenClaw QueueMode，见§System Member priority 承接 |
 | outbound @提及规范化 registry | 插件 | |
 | markdown 检测 + 3000 分块 | 插件 | OpenClaw `textChunkLimit` 承接一部分 |
 | 多 org（一 org 一 WS，单 org 熔断不连坐） | 插件 multi-account | MVP 单账户；对齐项，MVP 后补（hxa-connect accounts 结构现成） |
 | TM/KB/AS/Comm/Core CLI + 技能层 | SDK 全面范围 | 插件按 hxa-connect `registerTools` 模式注册 agent tools |
+
+## System Member priority 承接（OpenClaw 源码探索结论）
+
+zylos 侧语义：SYSTEM 发送者消息带 priority（urgent/high/normal），映射到 c4-receive 的 1/2/3 优先级，让平台信号（如审批解锁）**排在普通聊天前面处理**——只影响排队顺序，不打断进行中的任务。
+
+OpenClaw 侧事实（源码结论，非猜测）：
+
+- **没有 per-message 优先级队列**。内部 command-queue 确有 foreground(1)/normal(0)/background(-1) 三档，但由 trigger 决定（`user`/`manual`→foreground，`cron`/`heartbeat`→background），channel inbound 一律 trigger=`user`，插件无法按消息调档（`resolveEmbeddedRunSessionQueuePriority`，lane-runtime.ts）。
+- 真正的承接机制是 **QueueMode**（`src/auto-reply/reply/queue/`）：决定"agent 正忙时新消息怎么处理"，四种——`steer`（**默认**：注入进行中的 turn，消息立即进 agent 可见上下文）/ `followup`（当前 run 结束后排队执行）/ `collect`（合并缓冲）/ `interrupt`（清空 session lane + abort 当前 run，立即处理）。解析优先级：inlineMode（每消息）> session 持久化 > 每 channel 配置 > 全局配置 > 默认 `steer`。
+- **每消息覆盖入口**：`replyOptions.queueModeOverride`。从插件调用的 `dispatchReplyWithBufferedBlockDispatcher` 起 replyOptions 全链路原样透传，`dispatchFromConfig` 的签名就是含该字段的 Internal 类型，运行时生效。**注意**：该字段定义在 `InternalReplySessionOptions`（get-reply.types.ts），插件边界的公开类型没有它——属"运行时可用、类型面未承诺"，要靠连通性测试锁行为，OpenClaw 升级时留意。
+
+**采纳的映射**：
+
+| SYSTEM priority | 插件动作 | 效果 |
+|---|---|---|
+| normal / 无 | 不覆盖 | 尊重 operator 配置的 QueueMode |
+| high | `queueModeOverride: "steer"` | 即使该 channel 被配成 followup/collect（如避免打扰长任务），平台信号也立刻进当前 turn 上下文 |
+| urgent | `queueModeOverride: "steer"`（默认）；`"interrupt"` 可配置开启 | interrupt 会 abort 进行中的 run——比 zylos 的"排队靠前"语义更激进，是否值得杀任务默认关闭，留配置项 |
+
+默认 QueueMode 本来就是 steer，所以空闲/默认场景下平台信号天然不被阻塞；这套映射只在 operator 改过队列策略时兜底。zylos 的"队列插队"（followup 队列 front 插入）OpenClaw 内部有（`EnqueueFollowupRunOptions.position: "front"`）但未暴露给插件，不依赖。
 
 ## 关键不变式（沿自方案 §4/§6）
 
@@ -78,8 +98,8 @@ openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接）�
 ## 开放问题（阻塞项加粗）
 
 1. **`cws-agent-sdk` API 形态未定**——尤其 seq 持久化、/sync 补拉、去重归 SDK 还是插件；等 gavin 的接口定稿对齐，插件内 `TODO(sdk)` 即接线点。
-2. System Member priority 在 OpenClaw 会话侧如何承接（OpenClaw 有无消息优先级概念）。
-3. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
+2. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
+3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖；可顺手给 OpenClaw 提 issue/PR 把它提升为插件公开选项。
 
 ## MVP 五步（对齐方案 §8）
 
