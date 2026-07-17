@@ -2,46 +2,91 @@
 
 状态：骨架已建，CWS 接线阻塞在 `@coco-xyz/cws-agent-sdk` 首次发布。
 上游方案：OpenMax Agent Runtime 接入方案 v1（Howard 2026-07-17 已拍板）。
+English version: [design.en.md](./design.en.md)
 
 ## 结论
 
-openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接），完全复用 openclaw-hxa-connect 的已验证结构：连接层交给共享 SDK，插件只做两件事——CWS 消息注入 OpenClaw 会话（inbound）、agent 回复送回 CWS（outbound）。不自建 session / 压缩，OpenClaw 自带。
+openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接），结构复用 openclaw-hxa-connect（插件形态、channel 注册、gateway 生命周期），**行为语义对齐 zylos-openmax**（仓库 `coco-workspace/zylos-coco-workspace`）——尤其群会话的准入策略、@提及门控、群上下文注入，逐条照搬其已验证做法。连接层交给共享 SDK，插件只做 inbound（CWS 消息注入 OpenClaw 会话）和 outbound（agent 回复送回 CWS）。
 
-## 与参考实现（openclaw-hxa-connect v2.7.0）的对应关系
+## 两侧参考实现
 
-| openclaw-hxa-connect | openclaw-openmax | 说明 |
+| 参考 | 借什么 |
+|---|---|
+| openclaw-hxa-connect v2.7.0 | OpenClaw 插件骨架：registerChannel、gateway.startAccount、outbound.sendText、多账户结构 |
+| zylos-openmax（zylos-coco-workspace） | CWS 侧全部行为语义：策略过滤、群会话处理、消息格式、媒体、断线补拉 |
+
+## 群会话处理（照搬 zylos-openmax `comm-bridge.js`）
+
+### 准入策略（shouldHandleMessage 逐条对齐）
+
+- **DM**：`dmPolicy` = `owner`（默认）/ `open` / `allowlist`。`owner` 模式下首条 DM 自动绑定发送者为 owner；非 owner 拒绝并回复礼貌拒绝语。
+- **群**：`groupPolicy` = `allowlist`（默认）/ `open` / `disabled`。allowlist 按 `access.groups[conversationId]` 判定；**owner 的 @提及可绕过 allowlist 门**。
+- **每群配置**：`groups[convId] = { name, mode, allowFrom }`。`allowFrom` 空或含 `*` 即全员；owner 豁免 allowFrom。
+- **响应模式**：`mode` = `mention`（默认，只响应 @我）/ `smart`（收全部消息，注入 `<smart-mode>` 提示让模型自判，回复 `[SKIP]` 即静默——outbound 侧拦截不真发）。被直接 @ 时不注入 smart 提示，直接答。
+- **@检测双路**：结构化 `mentions[]`（`entity_id`）+ 文本兜底 `@<selfName>(?![\w-])`（服务端常只给原始文本，无兜底则 mention 门形同虚设）。
+- **拒绝通知**：群内只有发送者确实 @了我们才回拒绝语（否则静默，避免刷屏）；DM 拒绝总是通知；**sync 补拉帧和 AGENT 发送者一律不回**（防止翻旧账刷屏和 agent 间拒绝语乒乓）。
+- **自回声**：`sender_id == self.member_id` 直接丢弃。
+- **System Member**：`sender_type=SYSTEM`（审批中心、调度器等平台信号）绕过全部策略门，且带 priority（urgent/high/normal）映射到投递优先级。
+
+### 上下文构建（formatInboundForC4 对齐）
+
+- **群上下文**：取当前消息 `before_seq` 前 N 条（默认 5），升序排列，逐条解析发送者显示名（进程内缓存），包成 `<group-context>` 块。
+- **引用回复**：`parent_id` 存在时拉取被引消息包成 `<replying-to>`；被引媒体要下载并附本地路径（否则空文本引用整块丢失）。
+- **thread**：`thread_id` 存在时包 `<thread-context>`，根消息标 `<thread-root>`；thread 优先于引用块。
+- **媒体**：附件取 `attachments[].artifact_id`（**必须是 cws-as 的 artifact_id，不是 media_id**——用错 FE 永远转圈，zylos 侧踩过），解析 URL 下载到本地，正文标 `[image]`/`[file: name]`，尾缀 `---- image/file: <本地路径>`。
+- **防结构逃逸**：用户文本进 XML 块前只转义 `<`/`>`（够挡 `</current-message>` 逃逸，不escape `&`/引号保持原文可读）。
+
+### 会话类型与状态
+
+- WS 帧不带会话类型，REST 拉 `GET /conversations/{id}` 一次并缓存。
+- 消息去重：TTL 5 分钟。
+- **seq 持久化 + 断线补拉**：每账户记 `last_seq`，重连后 `POST /sync`（页 100，单次上限 2000，超出下次重连续拉）。这是"消息不真丢"的关键。
+
+## Outbound（对齐 zylos send.js）
+
+- 幂等：每条消息 `client_msg_id`（服务端 5 分钟窗口去重），长文按 3000 字符分块（段落→换行→硬切），每块独立 `client_msg_id`，`parent_id` 只挂第一块。
+- 类型：agent 文本用 `AGENT_TEXT`；markdown 启发式检测决定 `content_type`。
+- **@提及规范化**：cws-fe 高亮纯靠文本 `@<精确 display_name>` 匹配。inbound 时记录会话参与者显示名（每会话上限 200，落盘 registry），outbound 时把 `@name` 规范化为记录的精确名（长名优先）。
+- `[SKIP]` 哨兵：smart 模式模型决定静默时输出 `[SKIP]`，outbound 拦截为 no-op。
+- 媒体：`[MEDIA:image|file]<path>` 前缀 → 经 cws-as 上传 → 附件挂 `artifact_id`、`file_name`、`content_type`（MIME 不能丢，丢了 FE 渲不出）。
+
+## 能力对齐矩阵（zylos-openmax → openclaw-openmax 落位）
+
+| zylos-openmax 能力 | 落位 | 备注 |
 |---|---|---|
-| `@coco-xyz/hxa-connect-sdk` | `@coco-xyz/cws-agent-sdk` | 连接管理、鉴权、心跳、指数退避重连 |
-| HXA Hub（WebSocket + webhook） | CWS Server（WebSocket） | MVP 不做 webhook 回退，CWS 侧无此形态 |
-| `dispatchInbound()` → Channel Router | 同结构 | inbound 主干 |
-| `routeOutboundMessage()` | 同结构 | outbound 主干，DM / 群会话路由 |
-| thread / @mention / smart mode | MVP 不做 | 后续按 CWS conversation 语义决定 |
-| 多账户（multi-account） | MVP 单账户 | 参考项目也是 v2.x 才加 |
-
-## 语义映射（待 SDK API 定稿后确认）
-
-| CWS 概念 | OpenClaw 概念 | 备注 |
-|---|---|---|
-| conversation（DM） | direct chat | |
-| conversation（群） | channel chat | @mention / 全量接收策略待定 |
-| inbox_seq / 消息游标 | — | 由 SDK 内部处理，插件不感知（需和 gavin 确认边界） |
-| agent token 鉴权 | 插件配置 `agentToken` | sensitive 字段 |
+| WS 连接/心跳/指数退避 | SDK | 方案 §2 SDK 职责 |
+| api_key → JWT → ws-ticket 鉴权链 | SDK | 4003 过期只作废 token 缓存，保留 last_seq |
+| seq 持久化 + /sync 断线补拉 | SDK（需确认） | 若 SDK 不管，插件必须自持；开放问题 #1 |
+| 消息去重（TTL 5min） | SDK 或插件 | 随 sync 归属一起定 |
+| client_msg_id 幂等 | SDK | |
+| 会话/成员名查询 + 缓存 | 插件 | REST 经 SDK client |
+| DM/群准入策略 + owner 自动绑定 | 插件 | 本文档§群会话 |
+| mention/smart 模式 + `[SKIP]` | 插件 | hxa-connect 已有同款 smart mode 可搬壳 |
+| 群上下文 / 引用 / thread 块 | 插件 | |
+| 媒体下载/上传（artifact_id） | 插件 + SDK（as 能力） | Howard 拍板 SDK 含 tm/kb/as CLI |
+| 拒绝通知（含免打扰规则） | 插件 | |
+| System Member priority | 插件 | OpenClaw 侧有无优先级承接待查 |
+| outbound @提及规范化 registry | 插件 | |
+| markdown 检测 + 3000 分块 | 插件 | OpenClaw `textChunkLimit` 承接一部分 |
+| 多 org（一 org 一 WS，单 org 熔断不连坐） | 插件 multi-account | MVP 单账户；对齐项，MVP 后补（hxa-connect accounts 结构现成） |
+| TM/KB/AS/Comm/Core CLI + 技能层 | SDK 全面范围 | 插件按 hxa-connect `registerTools` 模式注册 agent tools |
 
 ## 关键不变式（沿自方案 §4/§6）
 
-投递确认必须真实：只有消息确实进入 OpenClaw agent 可见上下文，才算送达成功；"返回成功但实际未送达"是最差失败模式。Category A 下这体现为：`dispatchInbound` 失败时必须让 SDK 层感知（不吞错），由 SDK 退避重投。
+投递确认必须真实：只有消息确实进入 OpenClaw agent 可见上下文，才算送达成功；"返回成功但实际未送达"是最差失败模式。`dispatchInbound` 失败必须让 SDK/补拉层感知（不吞错）。
 
 ## 开放问题（阻塞项加粗）
 
-1. **`cws-agent-sdk` API 形态未定**——inbound 订阅、send、ack 语义，等 gavin 的 SDK 仓库出接口后对齐；插件内所有 `TODO(sdk)` 即接线点。
-2. CWS conversation ↔ OpenClaw chatType 映射：群会话是否需要 @mention 过滤（参考项目的 ThreadContext 缓冲模式可搬）。
-3. 送达确认边界：seq ack 是 SDK 内部行为还是插件显式调用。
-4. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓与 branch protection（main 需 PR approval + CI 全绿）待有权限的人操作。
+1. **`cws-agent-sdk` API 形态未定**——尤其 seq 持久化、/sync 补拉、去重归 SDK 还是插件；等 gavin 的接口定稿对齐，插件内 `TODO(sdk)` 即接线点。
+2. System Member priority 在 OpenClaw 会话侧如何承接（OpenClaw 有无消息优先级概念）。
+3. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
 
 ## MVP 五步（对齐方案 §8）
 
 1. ✅ 仓库初始化（本骨架：README / package.json / 插件清单 / index.ts / CI）
 2. CWS 连接 + 鉴权（经 SDK）——阻塞在 SDK 发布
-3. Inbound：CWS 消息 → OpenClaw 会话
-4. Outbound：agent 回复 → CWS
+3. Inbound：CWS 消息 → 策略过滤 → 上下文构建 → OpenClaw 会话
+4. Outbound：agent 回复 → 规范化/分块 → CWS
 5. 双向连通性测试
+
+MVP 后对齐项：多账户、thread 完整支持、媒体收发、smart mode、agent tools（tm/kb/as）。

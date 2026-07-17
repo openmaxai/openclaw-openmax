@@ -14,10 +14,19 @@ function getRuntime(): PluginRuntime {
 }
 
 // ─── Types ───────────────────────────────────────────────────
+// Access-policy semantics are aligned with zylos-openmax (zylos-coco-workspace
+// comm-bridge shouldHandleMessage) — see docs/design.md.
+interface OpenMaxGroupConfig {
+  name?: string;
+  allowFrom?: string[];
+  mode?: "mention" | "smart";
+}
+
 interface OpenMaxAccessConfig {
-  dmPolicy?: "open" | "allowlist";
+  dmPolicy?: "owner" | "open" | "allowlist";
   dmAllowFrom?: string[];
   groupPolicy?: "open" | "allowlist" | "disabled";
+  groups?: Record<string, OpenMaxGroupConfig>;
 }
 
 interface OpenMaxChannelConfig {
@@ -28,6 +37,7 @@ interface OpenMaxChannelConfig {
   agentName?: string;
   orgId?: string;
   access?: OpenMaxAccessConfig;
+  owner?: { memberId?: string; name?: string };
 }
 
 function resolveOpenMaxConfig(cfg: any): OpenMaxChannelConfig {

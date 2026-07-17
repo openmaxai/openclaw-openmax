@@ -27,23 +27,51 @@
       },
       "access": {
         "type": "object",
-        "description": "Access control settings",
+        "description": "Access control settings (semantics aligned with zylos-openmax)",
         "properties": {
           "dmPolicy": {
             "type": "string",
-            "enum": ["open", "allowlist"],
-            "description": "DM policy: open (anyone) or allowlist (only dmAllowFrom)"
+            "enum": ["owner", "open", "allowlist"],
+            "description": "DM policy: owner (default; first DM auto-binds owner), open (anyone), or allowlist (only dmAllowFrom)"
           },
           "dmAllowFrom": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Allowed DM senders (when dmPolicy=allowlist)"
+            "description": "Allowed DM sender member IDs (when dmPolicy=allowlist)"
           },
           "groupPolicy": {
             "type": "string",
             "enum": ["open", "allowlist", "disabled"],
-            "description": "Group conversation access policy"
+            "description": "Group conversation access policy (default: allowlist, keyed by groups{})"
+          },
+          "groups": {
+            "type": "object",
+            "description": "Per-group (conversation) access and mode overrides",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "allowFrom": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Allowed sender member IDs; empty or [\"*\"] = everyone; owner is exempt"
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": ["mention", "smart"],
+                  "description": "mention (default: respond only when @-mentioned) or smart (receive all, model decides, [SKIP] to stay silent)"
+                }
+              }
+            }
           }
+        }
+      },
+      "owner": {
+        "type": "object",
+        "description": "Bound owner (auto-bound on first DM when dmPolicy=owner)",
+        "properties": {
+          "memberId": { "type": "string" },
+          "name": { "type": "string" }
         }
       }
     }

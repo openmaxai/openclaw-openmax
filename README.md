@@ -62,7 +62,9 @@ Same two-layer pattern as [openclaw-hxa-connect](https://github.com/coco-xyz/ope
 
 ## Design notes
 
-See [docs/design.md](./docs/design.md) (Chinese) for the CWS ↔ OpenClaw semantic mapping and open questions.
+See [docs/design.en.md](./docs/design.en.md) (English) / [docs/design.md](./docs/design.md) (Chinese) for the CWS ↔ OpenClaw semantic mapping, the zylos-openmax capability alignment matrix, and open questions.
+
+Behavioral semantics (access policy, mention gating, group context, reconnect catch-up) are aligned with **zylos-openmax** (`zylos-coco-workspace`), the existing production CWS integration.
 
 ## License
 
