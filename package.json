@@ -19,6 +19,6 @@
   ],
   "author": "Coco AI (https://github.com/coco-xyz)",
   "dependencies": {
-    "@openmaxai/openmax-agent-sdk": "github:openmaxai/openmax-agent-sdk#0225c5c5f0a939bdf53554508684c9b5b4f2c7e2"
+    "@openmaxai/openmax-agent-sdk": "0.1.0-alpha.1"
   }
 }
