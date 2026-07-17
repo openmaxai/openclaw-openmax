@@ -13,9 +13,11 @@ import path from "path";
 // with zylos-openmax — see docs/design.md.
 import {
   AsService,
+  CommService,
   CwsAgentBridge,
   CwsHttpClient,
   TokenManager,
+  parseEndpoint,
   splitMessage,
 } from "@openmaxai/openmax-agent-sdk";
 
@@ -305,11 +307,45 @@ interface BridgeState {
   bridge: any;
   http: any;
   as: any;
+  comm: any;
   orgConfig: any;
   memberNames: Map<string, string>;
 }
 
 let state: BridgeState | null = null;
+
+// REST-only stack for processes without a running gateway bridge (e.g.
+// `openclaw message send` runs the plugin in a fresh CLI process). Outbound is
+// stateless REST, so it must not depend on the WS bridge singleton. Shares the
+// on-disk token cache with the gateway (atomic writes).
+interface RestStack {
+  http: any;
+  comm: any;
+  key: string;
+}
+
+let restStack: RestStack | null = null;
+
+function getRestStack(acct: OpenMaxChannelConfig): RestStack {
+  const key = `${acct.coreUrl}|${acct.orgId}|${acct.agentToken?.slice(0, 12)}`;
+  if (restStack?.key === key) return restStack;
+  if (!process.env.COCO_RPC_LOG) process.env.COCO_RPC_LOG = "0";
+  const storage = fileStorage(path.join(getDataDir(), "kv.json"));
+  const tokenManager = new TokenManager({
+    apiKey: acct.agentToken,
+    coreUrl: acct.coreUrl,
+    storage,
+    resolveDefaultOrgId: () => acct.orgId || "",
+  });
+  const http = new CwsHttpClient({
+    baseUrl: acct.coreUrl,
+    apiKey: acct.agentToken,
+    tokenManager,
+    resolveDefaultOrgId: () => acct.orgId || "",
+  });
+  restStack = { http, comm: new CommService(http), key };
+  return restStack;
+}
 
 // ─── Owner persistence (SDK onOwnerBind / onOwnerNameHint callbacks) ─────────
 async function persistOwner(memberId: string, name: string): Promise<void> {
@@ -561,7 +597,7 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
           const text = typeof payload === "string" ? payload : (payload?.text ?? payload?.body ?? String(payload));
           if (!text?.trim() || isSkipReply(text)) return;
           try {
-            await sendOutbound(st, msg.endpoint, text, { orgId: msg.orgId });
+            await sendOutbound(st, msg.endpoint, text);
           } catch (err: any) {
             console.error(`[openmax] reply send failed for msg=${msg.messageId}:`, err?.message || err);
           }
@@ -583,28 +619,27 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
 
 // ─── Outbound: OpenClaw → CWS ────────────────────────────────
 async function sendOutbound(
-  st: BridgeState,
+  sender: { comm: any },
   endpoint: string,
   text: string,
-  opts: { orgId?: string; replyTo?: string } = {},
+  opts: { replyTo?: string } = {},
 ): Promise<{ messageId: string; chunks: number }> {
-  const conversationId = endpoint.split("|")[0];
+  const ep = parseEndpoint(endpoint); // throws on an invalid endpoint
+  // A thread is its own conversation — send into it; else the parent conversation.
+  const conversationId = ep.threadConversationId || ep.conversationId;
+  const replyTo = opts.replyTo || ep.replyTo || ep.parentMessageId;
   const canonical = resolveMentions(text, conversationId);
   const chunks: string[] = splitMessage(canonical);
-  // parent_id only on the first chunk: bridge.send falls back to the endpoint's
-  // own |reply:/|parent: suffixes, so later chunks must go to a stripped
-  // endpoint (keep |thread: — it drives conversation routing).
-  const strippedEndpoint = endpoint
-    .split("|")
-    .filter((seg, i) => i === 0 || seg.startsWith("thread:"))
-    .join("|");
   let firstId = "";
   for (let i = 0; i < chunks.length; i++) {
-    const res = await st.bridge.send(i === 0 ? endpoint : strippedEndpoint, chunks[i], {
-      orgId: opts.orgId,
-      ...(i === 0 && opts.replyTo ? { replyTo: opts.replyTo } : {}),
+    // CommService.send: markdown auto-detect + client_msg_id idempotency.
+    // parent_id only on the first chunk to avoid duplicate threading.
+    const res = await sender.comm.send({
+      conversationId,
+      content: chunks[i],
+      ...(i === 0 && replyTo ? { replyTo } : {}),
     });
-    if (i === 0) firstId = res?.messageId || "";
+    if (i === 0) firstId = res?.id || res?.message_id || res?.message?.id || "";
   }
   return { messageId: firstId, chunks: chunks.length };
 }
@@ -778,7 +813,14 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
 
   // state must be live before start(): inbound frames can arrive as soon as the
   // WS opens, and deliverInbound reads the module singleton.
-  const st: BridgeState = { bridge, http, as: new AsService(http), orgConfig, memberNames: new Map() };
+  const st: BridgeState = {
+    bridge,
+    http,
+    as: new AsService(http),
+    comm: new CommService(http),
+    orgConfig,
+    memberNames: new Map(),
+  };
   state = st;
   try {
     await bridge.start();
@@ -847,14 +889,15 @@ const openMaxChannel = {
     deliveryMode: "direct" as const,
     textChunkLimit: 8000,
     sendText: async (params: { cfg: any; to: string; text: string; replyToId?: string }) => {
-      const st = state;
-      if (!st) throw new Error("openmax: bridge not connected");
       // [SKIP] sentinel: signal non-delivery via an empty messageId result
       // (channel-specific extras belong in meta per OutboundDeliveryResult).
       if (isSkipReply(params.text)) return { channel: "openmax" as const, messageId: "", meta: { skipped: true } };
       const acct = resolveOpenMaxConfig(params.cfg);
-      const { messageId, chunks } = await sendOutbound(st, params.to, params.text, {
-        orgId: acct.orgId,
+      if (!(acct.coreUrl && acct.agentToken && acct.orgId)) throw new Error("openmax: channel not configured");
+      // Outbound is stateless REST: use the gateway bridge's stack when we're
+      // in that process, else a REST-only stack (CLI `openclaw message send`).
+      const sender = state ?? getRestStack(acct);
+      const { messageId, chunks } = await sendOutbound(sender, params.to, params.text, {
         replyTo: params.replyToId,
       });
       return { channel: "openmax" as const, messageId, meta: { chunks } };
