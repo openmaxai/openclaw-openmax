@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
+import { randomUUID } from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -26,10 +27,14 @@ function getRuntime(): PluginRuntime {
 
 let _dataDirWarned = false;
 function getDataDir(): string {
-  const baseDir = getRuntime().dataDir;
-  if (baseDir) return path.join(baseDir, "openmax");
+  const runtime = getRuntime() as any;
+  // runtime.state.resolveStateDir() is the supported persistent-state surface;
+  // dataDir is kept as a fallback for older OpenClaw builds. tmpdir is a last
+  // resort only — it would lose the inbox-ledger dedupe state on reboot.
+  const baseDir = runtime.state?.resolveStateDir?.() || runtime.dataDir;
+  if (baseDir) return path.join(baseDir, "plugins", "openclaw-openmax");
   if (!_dataDirWarned) {
-    console.warn("[openmax] runtime.dataDir is undefined, falling back to os.tmpdir()");
+    console.warn("[openmax] no persistent state dir available, falling back to os.tmpdir()");
     _dataDirWarned = true;
   }
   return path.join(os.tmpdir(), "openclaw-openmax");
@@ -77,17 +82,26 @@ const ACCOUNT_ID = "default"; // MVP is single-account; multi-account is a post-
 function readJson(file: string): any {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
+  } catch (err: any) {
+    // A corrupt (vs absent) store must be loud: losing kv.json silently resets
+    // the inbox ledger and JWT cache, which replays already-ACKed messages.
+    if (err?.code !== "ENOENT") {
+      console.error(`[openmax] read ${file} failed (treating as empty): ${err?.message}`);
+    }
     return null;
   }
 }
 
 function writeJson(file: string, value: any): void {
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
+    // 0700/0600 — kv.json holds cached JWT/refresh tokens. tmp+rename keeps a
+    // crash mid-write from truncating the ledger/token store.
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
   } catch (err: any) {
-    console.warn(`[openmax] write ${file} failed: ${err?.message}`);
+    console.error(`[openmax] write ${file} failed: ${err?.message}`);
   }
 }
 
@@ -112,6 +126,7 @@ function fileStorage(file: string) {
 // text `@<exact display_name>` of a conversation participant, so we record the
 // names we see inbound and canonicalize `@name` tokens on the way out.
 const MAX_NAMES_PER_CONV = 200;
+const MAX_TRACKED_CONVS = 500;
 const normName = (s: unknown) => String(s ?? "").trim().toLowerCase();
 
 function mentionRegistryPath(): string {
@@ -138,6 +153,11 @@ function recordParticipants(conversationId: string, names: Array<string | undefi
   if (keys.length > MAX_NAMES_PER_CONV) {
     for (const k of keys.slice(0, keys.length - MAX_NAMES_PER_CONV)) delete conv[k];
   }
+  // Also bound the number of tracked conversations (drop oldest insertion).
+  const convIds = Object.keys(reg);
+  if (convIds.length > MAX_TRACKED_CONVS) {
+    for (const id of convIds.slice(0, convIds.length - MAX_TRACKED_CONVS)) delete reg[id];
+  }
   writeJson(file, reg);
 }
 
@@ -150,7 +170,9 @@ function resolveMentions(text: string, conversationId: string): string {
   let out = text;
   for (const name of names) {
     const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp("@" + esc, "gi"), "@" + name);
+    // Replacer function: a display name containing `$&`/`$'` must not expand
+    // as a replacement pattern and splice message text into the output.
+    out = out.replace(new RegExp("@" + esc, "gi"), () => "@" + name);
   }
   return out;
 }
@@ -195,12 +217,16 @@ function buildInboundBody(text: string, blocks: ContextBlocks): string {
 }
 
 /** Label media messages so an image/file isn't delivered as an empty body.
- *  MVP: label only; attachment download is a post-MVP alignment item. */
+ *  MVP: label only; attachment download is a post-MVP alignment item.
+ *  `text` must already be escaped by the caller; file_name is escaped here. */
 function labelMedia(text: string, msgType: string, attachments: any[]): string {
   const first = Array.isArray(attachments) ? attachments[0] : null;
   const isImage = msgType === "image" || msgType === "agent_card";
   if (isImage) return `[image]${text ? " " + text : ""}`;
-  if (first) return `[file${first.file_name ? ": " + first.file_name : ""}]${text ? " " + text : ""}`;
+  if (first) {
+    const fileName = first.file_name ? escapeXml(String(first.file_name).replace(/[\r\n]+/g, " ")) : "";
+    return `[file${fileName ? ": " + fileName : ""}]${text ? " " + text : ""}`;
+  }
   return text;
 }
 
@@ -234,12 +260,15 @@ let state: BridgeState | null = null;
 
 // ─── Owner persistence (SDK onOwnerBind / onOwnerNameHint callbacks) ─────────
 async function persistOwner(memberId: string, name: string): Promise<void> {
-  const runtime = getRuntime();
+  const runtime = getRuntime() as any;
   try {
-    const cfg = await (runtime as any).config.loadConfig();
-    const openmax = (((cfg.channels ||= {}) as any).openmax ||= {});
+    // loadConfig()/current() return the LIVE shared config snapshot — clone
+    // before mutating so a failed write can't corrupt other consumers.
+    const loaded = runtime.config.current?.() ?? (await runtime.config.loadConfig());
+    const cfg = structuredClone(loaded ?? {});
+    const openmax = ((cfg.channels ||= {}).openmax ||= {});
     openmax.owner = { memberId, ...(name ? { name } : {}) };
-    await (runtime as any).config.writeConfigFile(cfg);
+    await runtime.config.writeConfigFile(cfg);
     console.log(`[openmax] owner persisted: member_id=${memberId} name="${name}"`);
   } catch (err: any) {
     console.error(`[openmax] owner persist failed: ${err?.message}`);
@@ -247,6 +276,19 @@ async function persistOwner(memberId: string, name: string): Promise<void> {
 }
 
 // ─── Inbound: CWS → OpenClaw session ─────────────────────────
+// The SDK http client has no request timeout; context fetches degrade to their
+// fallback instead of stalling the org's delivery pipeline on a hung request.
+const CONTEXT_FETCH_TIMEOUT_MS = 8_000;
+function withTimeout<T>(p: Promise<T>, fallback: T, ms = CONTEXT_FETCH_TIMEOUT_MS): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((resolve) => {
+      const t = setTimeout(() => resolve(fallback), ms);
+      (t as any).unref?.();
+    }),
+  ]);
+}
+
 async function resolveMemberName(st: BridgeState, orgId: string, memberId: string): Promise<string | null> {
   if (!memberId) return null;
   const cached = st.memberNames.get(memberId);
@@ -328,7 +370,9 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   const st = state;
   if (!st) return { ok: false, failureClass: "wake_failed", retryAfterMs: 5_000 };
   const core = getRuntime();
-  const cfg = (core as any).config ? await (core as any).config.loadConfig() : {};
+  // config.current() is the sanctioned cached-snapshot accessor; loadConfig()
+  // is kept as a fallback for older OpenClaw builds (it is deprecated, not gone).
+  const cfg = (core as any).config.current?.() ?? (await (core as any).config.loadConfig());
   const acct = resolveOpenMaxConfig(cfg);
 
   const isDm = msg.conversationType === "dm";
@@ -339,9 +383,11 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   // Record participant names for outbound @mention canonicalization.
   recordParticipants(msg.conversationId, [senderName]);
 
-  // mode=silent: consume as context only — record it, never wake the agent.
-  // (SDK semantics: decideInbound passes silent through with mode surfaced and
-  // leaves the interpretation to the adapter; confirm with the SDK owner.)
+  // mode=silent: consume without waking the agent — only the sender name (already
+  // recorded above) is captured; history is re-fetched from CWS on the next
+  // non-silent delivery, so nothing is lost. (SDK semantics: decideInbound passes
+  // silent through with mode surfaced and leaves interpretation to the adapter;
+  // confirm with the SDK owner.) ok:true is the intended ACK here.
   if (msg.decision?.mode === "silent") {
     return { ok: true };
   }
@@ -349,32 +395,38 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   // Context blocks (group history + quoted reply + smart hint).
   const blocks: ContextBlocks = {};
   if (!isDm) {
-    blocks.groupContext = await fetchGroupContext(
-      st,
-      msg.orgId,
-      msg.conversationId,
-      msg.seq,
-      acct.contextMessages ?? DEFAULT_CONTEXT_MESSAGES,
+    blocks.groupContext = await withTimeout(
+      fetchGroupContext(st, msg.orgId, msg.conversationId, msg.seq, acct.contextMessages ?? DEFAULT_CONTEXT_MESSAGES),
+      [],
     );
     recordParticipants(msg.conversationId, blocks.groupContext.map((m) => m.senderName));
   }
   if (msg.parentMessageId && msg.conversationType !== "thread") {
-    blocks.quoted = await fetchQuoted(st, msg.orgId, msg.conversationId, msg.parentMessageId);
+    blocks.quoted = await withTimeout(
+      fetchQuoted(st, msg.orgId, msg.conversationId, msg.parentMessageId),
+      undefined,
+    );
   }
   blocks.smartHint = msg.decision?.mode === "smart" && !msg.decision?.mentioned;
 
-  const rawText = labelMedia(msg.text || "", msg.type || "", msg.attachments || []);
+  // Escape the sender-controlled text BEFORE the plugin-generated media label is
+  // prepended — a message body must not be able to forge <group-context>/<replying-to>
+  // framing (zylos escapes the current message the same way).
+  const rawText = labelMedia(escapeXml(msg.text || ""), msg.type || "", msg.attachments || []);
   const content = buildInboundBody(rawText, blocks);
 
   const from = `openmax:${msg.senderId || "unknown"}`;
   const to = `openmax:${ACCOUNT_ID}`;
 
+  // peer drives per-conversation session isolation (buildAgentSessionKey);
+  // without it every conversation collapses into the agent's main session.
   const route = (core as any).channel.routing.resolveAgentRoute({
-    channel: "openmax",
-    from,
-    chatType,
-    groupSubject: isDm ? undefined : groupName || msg.conversationId,
     cfg,
+    channel: "openmax",
+    accountId: ACCOUNT_ID,
+    peer: isDm
+      ? { kind: "direct" as const, id: msg.senderId || msg.conversationId }
+      : { kind: "group" as const, id: msg.conversationId },
   });
 
   const envelopeOptions = (core as any).channel.reply.resolveEnvelopeFormatOptions(cfg);
@@ -410,17 +462,30 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
     ConversationLabel: isDm ? senderName : groupName || msg.conversationId,
   });
 
-  const queueModeOverride = resolveQueueModeOverride(priority, acct.urgentQueueMode);
+  // Priority is read from message metadata, which a non-system sender could
+  // forge; only genuine System Members may escalate queue handling (interrupt
+  // would abort the agent's in-flight work).
+  const queueModeOverride =
+    msg.senderType === "SYSTEM" ? resolveQueueModeOverride(priority, acct.urgentQueueMode) : undefined;
 
   try {
     await (core as any).channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg,
       dispatcherOptions: {
+        // Reply-failure semantics (matches zylos): the ACK point is "message
+        // entered the agent session" — a later failure sending the agent's
+        // reply back to CWS is logged, but must NOT re-run the inbound (that
+        // would make the agent process the same message twice and re-post
+        // already-sent chunks).
         deliver: async (payload: any) => {
           const text = typeof payload === "string" ? payload : (payload?.text ?? payload?.body ?? String(payload));
           if (!text?.trim() || isSkipReply(text)) return;
-          await sendOutbound(st, msg.endpoint, text, { orgId: msg.orgId });
+          try {
+            await sendOutbound(st, msg.endpoint, text, { orgId: msg.orgId });
+          } catch (err: any) {
+            console.error(`[openmax] reply send failed for msg=${msg.messageId}:`, err?.message || err);
+          }
         },
         onError: (err: any, info: any) => {
           console.error(`[openmax] ${info?.kind ?? "unknown"} reply error:`, err);
@@ -447,10 +512,16 @@ async function sendOutbound(
   const conversationId = endpoint.split("|")[0];
   const canonical = resolveMentions(text, conversationId);
   const chunks: string[] = splitMessage(canonical);
+  // parent_id only on the first chunk: bridge.send falls back to the endpoint's
+  // own |reply:/|parent: suffixes, so later chunks must go to a stripped
+  // endpoint (keep |thread: — it drives conversation routing).
+  const strippedEndpoint = endpoint
+    .split("|")
+    .filter((seg, i) => i === 0 || seg.startsWith("thread:"))
+    .join("|");
   let firstId = "";
   for (let i = 0; i < chunks.length; i++) {
-    // parent_id only on the first chunk to avoid duplicate threading.
-    const res = await st.bridge.send(endpoint, chunks[i], {
+    const res = await st.bridge.send(i === 0 ? endpoint : strippedEndpoint, chunks[i], {
       orgId: opts.orgId,
       ...(i === 0 && opts.replyTo ? { replyTo: opts.replyTo } : {}),
     });
@@ -474,7 +545,31 @@ function buildOrgConfig(acct: OpenMaxChannelConfig): any {
   };
 }
 
-async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<void> {
+/** Stable per-install device id — cws-comm keys /sync cursors per device. */
+function stableDeviceId(dataDir: string): string {
+  const file = path.join(dataDir, "device-id");
+  try {
+    const v = fs.readFileSync(file, "utf8").trim();
+    if (v) return v;
+  } catch {
+    /* first run */
+  }
+  const v = `openclaw-openmax-${randomUUID()}`;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, v + "\n", { mode: 0o600 });
+  } catch {
+    /* non-persistent id still works for this process */
+  }
+  return v;
+}
+
+async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<BridgeState> {
+  // The SDK http client logs full RPC responses (incl. the token-exchange
+  // response carrying JWT + refresh token) unless COCO_RPC_LOG=0. Default it
+  // off; an operator can still opt in explicitly.
+  if (!process.env.COCO_RPC_LOG) process.env.COCO_RPC_LOG = "0";
+
   const dataDir = getDataDir();
   const storage = fileStorage(path.join(dataDir, "kv.json"));
   const logger = {
@@ -493,8 +588,9 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<void> 
     resolveDefaultOrgId: () => acct.orgId || "",
     // cws-core writes the agent's member_id back on token exchange; keep the
     // live orgConfig in sync so the self-echo / @-mention gates work.
-    onMemberId: (memberId: string) => {
-      orgConfig.self.member_id = memberId;
+    // NOTE the SDK signature is (orgId, memberId).
+    onMemberId: (_orgId: string, memberId: string) => {
+      if (memberId) orgConfig.self.member_id = memberId;
     },
     logger,
   });
@@ -512,7 +608,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<void> 
   const bridge = new CwsAgentBridge({
     http,
     tokenManager,
-    ws: { baseUrl: acct.wsUrl },
+    ws: { baseUrl: acct.wsUrl, deviceId: stableDeviceId(dataDir), clientVersion: "0.1.0" },
     orgConfigs: [orgConfig],
     providers: {
       storage,
@@ -524,6 +620,25 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<void> 
       saveSession: (slug: string, partial: any) => {
         writeJson(sessionFile(slug), { ...(readJson(sessionFile(slug)) || {}), ...partial });
       },
+      // Self-name hydration barrier: fetch the authoritative display_name so
+      // text "@Name" mention detection matches what cws-fe renders. Without
+      // this the SDK never reaches nameReady and burns retry backoff per
+      // (re)connect.
+      syncSelf: async (oc: any) => {
+        const memberId = oc?.self?.member_id;
+        if (!memberId) return { nameReady: false, reason: "no member_id yet" };
+        try {
+          const m = await http.getForOrg(oc.org_id, http.apiPath(`/members/${memberId}`));
+          const name = m?.display_name || m?.username;
+          if (!name) return { nameReady: false, reason: "member has no display_name" };
+          oc.self = { ...(oc.self || {}), display_name: name, name };
+          return { nameReady: true };
+        } catch (err: any) {
+          return { nameReady: false, reason: err?.message || "self fetch failed" };
+        }
+      },
+      // member_id write-back backfill source for the hydrator.
+      loadConfig: () => ({ orgs: { [ACCOUNT_ID]: orgConfig } }),
       onOwnerBind: (_slug: string, memberId: string, displayName: string) => {
         orgConfig.owner = { member_id: memberId, name: displayName || "" };
         void persistOwner(memberId, displayName);
@@ -539,19 +654,30 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<void> 
     reporters: { version: "0.1.0" },
   });
 
-  state = { bridge, http, orgConfig, memberNames: new Map() };
-  await bridge.start();
+  // state must be live before start(): inbound frames can arrive as soon as the
+  // WS opens, and deliverInbound reads the module singleton.
+  const st: BridgeState = { bridge, http, orgConfig, memberNames: new Map() };
+  state = st;
+  try {
+    await bridge.start();
+  } catch (err) {
+    await stopBridge(st);
+    throw err;
+  }
+  return st;
 }
 
-async function stopBridge(): Promise<void> {
-  const st = state;
-  state = null;
-  if (st) {
-    try {
-      await st.bridge.stop();
-    } catch {
-      /* stopping a half-started bridge must not throw out of the gateway */
-    }
+/** Tear down a bridge. With a target, only clears the module singleton when it
+ *  still points at that bridge — an old gateway invocation's teardown must not
+ *  kill a newer bridge that already replaced it (restart race). */
+async function stopBridge(target?: BridgeState): Promise<void> {
+  const st = target ?? state;
+  if (!st) return;
+  if (state === st) state = null;
+  try {
+    await st.bridge.stop();
+  } catch {
+    /* stopping a half-started bridge must not throw out of the gateway */
   }
 }
 
@@ -601,24 +727,28 @@ const openMaxChannel = {
     sendText: async (params: { cfg: any; to: string; text: string; replyToId?: string }) => {
       const st = state;
       if (!st) throw new Error("openmax: bridge not connected");
-      if (isSkipReply(params.text)) return { channel: "openmax" as const, messageId: "", skipped: true };
+      // [SKIP] sentinel: signal non-delivery via an empty messageId result
+      // (channel-specific extras belong in meta per OutboundDeliveryResult).
+      if (isSkipReply(params.text)) return { channel: "openmax" as const, messageId: "", meta: { skipped: true } };
       const acct = resolveOpenMaxConfig(params.cfg);
-      const result = await sendOutbound(st, params.to, params.text, {
+      const { messageId, chunks } = await sendOutbound(st, params.to, params.text, {
         orgId: acct.orgId,
         replyTo: params.replyToId,
       });
-      return { channel: "openmax" as const, ...result };
+      return { channel: "openmax" as const, messageId, meta: { chunks } };
     },
   },
   gateway: {
     startAccount: async (ctx: any) => {
       const acct = resolveOpenMaxConfig(ctx.cfg);
       ctx.setStatus?.({ accountId: ctx.accountId || ACCOUNT_ID });
+      let st: BridgeState | null = null;
       if (acct.coreUrl && acct.wsUrl && acct.agentToken && acct.orgId) {
         try {
-          await startBridge(acct, ctx.log);
+          st = await startBridge(acct, ctx.log);
           ctx.log?.info?.("openmax: bridge started");
         } catch (err: any) {
+          // startBridge already tore down its own half-started bridge.
           ctx.log?.error?.(`openmax: bridge start failed: ${err?.message}`);
         }
       } else {
@@ -628,7 +758,8 @@ const openMaxChannel = {
         if (ctx.abortSignal?.aborted) return resolve();
         ctx.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
       });
-      await stopBridge();
+      // Tear down only the bridge THIS invocation started (restart-race safe).
+      if (st) await stopBridge(st);
     },
     stopAccount: async (_ctx: any) => {
       await stopBridge();
