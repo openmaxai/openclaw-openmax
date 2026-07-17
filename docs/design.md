@@ -1,6 +1,6 @@
 # openclaw-openmax 接入设计
 
-状态：骨架已建，CWS 接线阻塞在 `@coco-xyz/cws-agent-sdk` 首次发布。
+状态：已实现（SDK=npm `@openmaxai/openmax-agent-sdk@0.1.0-alpha.0`），本地 OpenClaw gateway 加载烟测通过；待真实 CWS 环境连通性测试。
 上游方案：OpenMax Agent Runtime 接入方案 v1（Howard 2026-07-17 已拍板）。
 English version: [design.en.md](./design.en.md)
 
@@ -97,9 +97,9 @@ OpenClaw 侧事实（源码结论，非猜测）：
 
 ## 开放问题（阻塞项加粗）
 
-1. **SDK 已评审通过**（[openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) PR#1，全量抽取 +11k 行含 orchestrator/schemas/fixtures）——上一轮 4 个确认点结论：① `InboundMessage` 必带 `senderType`(HUMAN/AGENT/SYSTEM)，`priority`(1/2/3) 作为 `deliver(msg, endpoint, priority)` 第三参传入，QueueMode 映射输入齐了；② outbound：client_msg_id/markdown 检测/`splitMessage(3000)` 均在 SDK（分块需插件自行调用），媒体 `uploadMedia` 返回 artifactId、附件组装归插件；③ access policy 归 SDK `decideInbound`（纯函数），decision（mode/mentioned/groupCfg/bindOwnerHint）随 InboundMessage 下发，群 mode 新增 `silent`，另有同 owner 的 sibling-agent DM 豁免；owner auto-bind 改为 `onOwnerBind` 回调、插件负责持久化；④ last_seq/ledger/dedup/token 持久化全走 StorageProvider + loadSession/saveSession。**唯一缺口：@提及规范化 registry 不在 SDK**（cws-fe 高亮契约是平台级的，四个 adapter 都要）——建议 SDK 收编，否则插件自带（zylos lib/mention.js 112 行可直接搬）。接线仍等 PR 合并 + npm 发版。
+1. **SDK 已评审通过**（[openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) PR#1，全量抽取 +11k 行含 orchestrator/schemas/fixtures）——上一轮 4 个确认点结论：① `InboundMessage` 必带 `senderType`(HUMAN/AGENT/SYSTEM)，`priority`(1/2/3) 作为 `deliver(msg, endpoint, priority)` 第三参传入，QueueMode 映射输入齐了；② outbound：client_msg_id/markdown 检测/`splitMessage(3000)` 均在 SDK（分块需插件自行调用），媒体 `uploadMedia` 返回 artifactId、附件组装归插件；③ access policy 归 SDK `decideInbound`（纯函数），decision（mode/mentioned/groupCfg/bindOwnerHint）随 InboundMessage 下发，群 mode 新增 `silent`，另有同 owner 的 sibling-agent DM 豁免；owner auto-bind 改为 `onOwnerBind` 回调、插件负责持久化；④ last_seq/ledger/dedup/token 持久化全走 StorageProvider + loadSession/saveSession。**唯一缺口：@提及规范化 registry 不在 SDK**（cws-fe 高亮契约是平台级的，四个 adapter 都要）——建议 SDK 收编，否则插件自带（zylos lib/mention.js 112 行可直接搬）。SDK 已发 npm，依赖已切换。
 2. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
-3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖；可顺手给 OpenClaw 提 issue/PR 把它提升为插件公开选项。
+3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖（已拍板不给 OpenClaw 提 issue，靠测试锁行为）。
 
 ## MVP 五步（对齐方案 §8）
 
