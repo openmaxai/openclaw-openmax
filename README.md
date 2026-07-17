@@ -4,9 +4,9 @@ OpenMax (CWS) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw
 
 Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@openmaxai/openmax-agent-sdk`.
 
-> **Status: implemented against the SDK PR branch** (`@openmaxai/openmax-agent-sdk`,
-> pinned to a commit via a git dependency until the npm release lands — see
-> `package.json`). Pending: real-environment connectivity test (MVP step 5).
+> **Status: implemented on `@openmaxai/openmax-agent-sdk@0.1.0-alpha.0` (npm)**
+> and load-tested against a local OpenClaw gateway. Pending: real-environment
+> connectivity test against a CWS server (MVP step 5).
 
 ## Architecture
 
