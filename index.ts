@@ -616,7 +616,30 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
       inbound: { deliver: deliverInbound },
     },
     callbacks: {
-      loadSession: (slug: string) => readJson(sessionFile(slug)) || {},
+      // Session-cursor recovery: the SDK persists the ledger watermark
+      // (kv.json, on every record) but only writes sync_seq on the periodic
+      // ack tick, and bridge.stop() doesn't flush it — so a restart shortly
+      // after a delivery finds no cursor and the SDK's first-connect
+      // seek-to-inbox-end SKIPS messages that arrived while we were down
+      // (observed live: owner's message lost across the owner-bind config
+      // restart). Seed the cursor from the ledger's acked_seq. NOTE: the
+      // `inbox-<slug>.json` storage key is SDK-internal — remove this once the
+      // SDK flushes the cursor on stop (reported upstream).
+      loadSession: (slug: string) => {
+        const session = readJson(sessionFile(slug));
+        if (session?.sync_seq) return session;
+        try {
+          const kv = readJson(path.join(dataDir, "kv.json")) || {};
+          const ledger = JSON.parse(kv[`inbox-${slug}.json`] || "null");
+          if (ledger?.acked_seq > 0) {
+            console.log(`[openmax] seeding sync_seq=${ledger.acked_seq} from inbox-ledger watermark`);
+            return { ...(session || {}), sync_seq: ledger.acked_seq };
+          }
+        } catch {
+          /* no ledger state — genuine first connect */
+        }
+        return session || {};
+      },
       saveSession: (slug: string, partial: any) => {
         writeJson(sessionFile(slug), { ...(readJson(sessionFile(slug)) || {}), ...partial });
       },
