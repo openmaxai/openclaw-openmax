@@ -97,7 +97,7 @@ OpenClaw 侧事实（源码结论，非猜测）：
 
 ## 开放问题（阻塞项加粗）
 
-1. **`cws-agent-sdk` API 形态未定**——尤其 seq 持久化、/sync 补拉、去重归 SDK 还是插件；等 gavin 的接口定稿对齐，插件内 `TODO(sdk)` 即接线点。
+1. **`cws-agent-sdk` 抽取中**（[openmaxai/cws-agent-sdk](https://github.com/openmaxai/cws-agent-sdk)，0.1.0-alpha.0 Phase A）——README 已定界：sync/去重/ack 归 SDK（SyncEngine + inbox-ledger），transport 层（WsClient/TokenManager/CwsHttpClient）已在 PR#1；inbound 走 `InboundDelivery.deliver()` provider（契约即我们的关键不变式）。待与 gavin 确认：① 中立消息 shape 须携带 `sender_type` + `systemEvent.priority`（QueueMode 映射的输入）；② outbound 语义（3000 分块/markdown 检测/client_msg_id/@registry/artifact_id）落 SDK 哪层；③ README 把 access policy 划进 SDK protocol/——若成立，本文档"策略过滤归插件"收缩为"插件配置 SDK 策略"，配置 schema 要对齐 SDK 形状；④ `StorageProvider` 需覆盖 last_seq 与 mention registry 持久化。
 2. 仓库落位 github.com/coco-xyz/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
 3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖；可顺手给 OpenClaw 提 issue/PR 把它提升为插件公开选项。
 

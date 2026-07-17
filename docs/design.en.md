@@ -97,7 +97,7 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 
 ## Open questions (blockers in bold)
 
-1. **`cws-agent-sdk` API shape undecided** — especially whether seq persistence, /sync catch-up, and dedup live in the SDK or the plugin; align once gavin's interface lands. All `TODO(sdk)` markers in the plugin are the wiring points.
+1. **`cws-agent-sdk` extraction in progress** ([openmaxai/cws-agent-sdk](https://github.com/openmaxai/cws-agent-sdk), 0.1.0-alpha.0 Phase A) — the README settles the boundary: sync/dedup/ack belong to the SDK (SyncEngine + inbox-ledger); the transport layer (WsClient/TokenManager/CwsHttpClient) is in PR#1; inbound goes through the `InboundDelivery.deliver()` provider (whose contract is exactly our key invariant). To confirm with gavin: ① the neutral message shape must carry `sender_type` + `systemEvent.priority` (input for our QueueMode mapping); ② where outbound semantics land (3000-char chunking / markdown detection / client_msg_id / mention registry / artifact_id); ③ the README puts access policy inside SDK protocol/ — if so, "policy filtering in plugin" in this doc shrinks to "plugin configures SDK policy" and our config schema must match the SDK shape; ④ `StorageProvider` needs to cover last_seq and mention-registry persistence.
 2. Repo home github.com/coco-xyz/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
 3. `queueModeOverride` is an OpenClaw-internal type field (works at runtime): the connectivity test must cover it; consider filing an OpenClaw issue/PR to promote it to a public plugin option.
 
