@@ -66,7 +66,7 @@ openclaw-openmax 是一个 OpenClaw channel 插件（Category A 协议桥接）�
 | 媒体下载/上传（artifact_id） | 插件 + SDK（as 能力） | Howard 拍板 SDK 含 tm/kb/as CLI |
 | 拒绝通知（含免打扰规则） | 插件 | |
 | System Member priority | 插件 | 映射到 OpenClaw QueueMode，见§System Member priority 承接 |
-| outbound @提及规范化 registry | 插件（SDK 无） | 建议 SDK 收编（平台级契约）；否则搬 zylos lib/mention.js |
+| outbound @提及规范化 registry | **SDK `createMentionRegistry`**（issue #8 已收编） | 插件注入 StorageProvider 并在 inbound 记名/outbound 规范化时调用 |
 | markdown 检测 + 3000 分块 | 插件 | OpenClaw `textChunkLimit` 承接一部分 |
 | 多 org（一 org 一 WS，单 org 熔断不连坐） | 插件 multi-account | MVP 单账户；对齐项，MVP 后补（hxa-connect accounts 结构现成） |
 | TM/KB/AS/Comm/Core CLI + 技能层 | SDK 全面范围 | 插件按 hxa-connect `registerTools` 模式注册 agent tools |
@@ -109,4 +109,4 @@ OpenClaw 侧事实（源码结论，非猜测）：
 4. ✅ Outbound：`[SKIP]` 拦截 → @提及规范化 → `splitMessage(3000)` 分块 → bridge.send（parent_id 只挂首块）
 5. ✅ 双向连通性测试——cws-int 实测：DM 往返、owner auto-bind 持久化、群门控（allowlist/@绕过/smart/[SKIP]）、图片与文件附件、长文分块、断线 /sync 补拉与游标恢复；queueModeOverride 待平台 SYSTEM 消息场景
 
-MVP 后对齐项：多账户、thread 完整支持、媒体收发（当前只打 `[image]`/`[file]` 标签不下载）、agent tools（tm/kb/as）、silent 模式语义与 SDK 侧确认。
+MVP 后对齐项：多账户、thread 完整支持、outbound 媒体（`[MEDIA:]` 前缀上传；inbound 媒体已实现——current+quoted 附件并行下载进 `ctx.MediaPaths`）、agent tools（tm/kb/as）。silent 语义已由 SDK issue #7 确认为上下文-only。

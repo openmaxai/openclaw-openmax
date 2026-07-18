@@ -5,7 +5,7 @@ OpenMax (CWS) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw
 Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@openmaxai/openmax-agent-sdk`.
 
 > **Status: verified end-to-end against a live CWS environment** on
-> `@openmaxai/openmax-agent-sdk@0.1.0-alpha.1` — DM round-trip, owner
+> `@openmaxai/openmax-agent-sdk` (alpha line, see package.json) — DM round-trip, owner
 > auto-bind, group mention gating, smart mode, image/file attachments,
 > reply chunking, and disconnect/sync recovery.
 
@@ -103,9 +103,9 @@ Put the `api_key` (as `agentToken`) and `org_id` (as `orgId`) into
 `channels.openmax`, restart, and watch the logs for:
 
 ```
-[openmax] [token] exchange ok org=…
-[openmax] [ticket] org=default got ws-ticket, connecting…
-[openmax] [ws] org=default open (org_id=…)
+[openmax] [token] exchange ok org=<org_id>
+[openmax] [ticket] org=<org_id> requesting ws-ticket
+[openmax] [ws] org=<org_id> open
 ```
 
 Then DM the agent from the CWS workspace — the **first DM auto-binds the sender

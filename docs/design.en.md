@@ -66,7 +66,7 @@ openclaw-openmax is an OpenClaw channel plugin (Category A protocol bridge). Its
 | Media download/upload (artifact_id) | Plugin + SDK (as capability) | Howard approved SDK scope incl. tm/kb/as CLIs |
 | Reject notices (incl. do-not-disturb rules) | Plugin | |
 | System Member priority | Plugin | Mapped onto OpenClaw QueueMode — see the System Member priority section |
-| Outbound mention canonicalization registry | Plugin (not in SDK) | Suggest the SDK absorbs it (platform-level contract); otherwise port zylos lib/mention.js |
+| Outbound mention canonicalization registry | **SDK `createMentionRegistry`** (absorbed per issue #8) | The plugin injects a StorageProvider and calls it on inbound (record names) / outbound (canonicalize) |
 | Markdown detection + 3000-char chunking | Plugin | OpenClaw `textChunkLimit` covers part of it |
 | Multi-org (one WS per org; one org going terminal doesn't kill the rest) | Plugin multi-account | MVP is single-account; alignment item post-MVP (hxa-connect accounts structure is ready to reuse) |
 | TM/KB/AS/Comm/Core CLIs + skill layer | SDK full scope | Plugin registers agent tools following hxa-connect's `registerTools` pattern |
@@ -109,4 +109,4 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 4. ✅ Outbound: `[SKIP]` interception → mention canonicalization → `splitMessage(3000)` chunking → bridge.send (parent_id on the first chunk only)
 5. ✅ Bidirectional connectivity test — verified on cws-int: DM round-trip, owner auto-bind persistence, group gating (allowlist / @bypass / smart / `[SKIP]`), image + file attachments, reply chunking, disconnect + /sync catch-up with cursor recovery; queueModeOverride still needs a platform SYSTEM-message scenario
 
-Post-MVP alignment items: multi-account, full thread support, media send/receive (currently label-only `[image]`/`[file]`, no download), agent tools (tm/kb/as), confirming silent-mode semantics with the SDK owner.
+Post-MVP alignment items: multi-account, full thread support, outbound media (`[MEDIA:]` prefix upload; inbound media is DONE — current + quoted attachments download in parallel into `ctx.MediaPaths`), agent tools (tm/kb/as). Silent-mode semantics were confirmed as context-only via SDK issue #7.
