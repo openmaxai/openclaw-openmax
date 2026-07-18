@@ -434,9 +434,14 @@ async function fetchQuoted(
       "";
     const attachments: any[] = Array.isArray(structured.attachments) ? structured.attachments : [];
     // A caption-less quoted image/file would otherwise drop the whole quote.
+    // Build the label UNESCAPED here — buildInboundBody escapes the quoted text
+    // exactly once (labelMedia pre-escapes file_name, which would double-escape
+    // if escapeXml ever grows beyond </>).
     if (!text && attachments.length > 0) {
       const qType = (q?.message?.type || "").toLowerCase();
-      text = labelMedia("", qType, attachments);
+      const isImage = qType === "image" || qType === "agent_card";
+      const fileName = String(attachments[0]?.file_name || "").replace(/[\r\n]+/g, " ");
+      text = isImage ? "[image]" : `[file${fileName ? ": " + fileName : ""}]`;
     }
     if (!text) return undefined;
     const senderId = q?.message?.sender_id;
@@ -774,7 +779,10 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
         orgConfig.owner = { member_id: memberId, name: displayName || "" };
         void persistOwner(memberId, displayName);
       },
-      onOwnerNameHint: (_slug: string, name: string) => {
+      onOwnerNameHint: (_orgId: string, name: string) => {
+        // Defensive: the SDK only emits the hint for a bound owner, but never
+        // persist a name without a member_id (it would drop the binding).
+        if (!orgConfig.owner?.member_id || !name) return;
         orgConfig.owner.name = name;
         void persistOwner(orgConfig.owner.member_id, name);
       },
