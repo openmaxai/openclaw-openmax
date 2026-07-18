@@ -240,41 +240,48 @@ interface DownloadedMedia {
   mime: string;
 }
 
+const MAX_ATTACHMENTS_PER_MESSAGE = 8;
+
 async function downloadAttachments(st: BridgeState, core: any, attachments: any[]): Promise<DownloadedMedia[]> {
-  const out: DownloadedMedia[] = [];
-  for (const att of attachments || []) {
-    const artifactId = att?.artifact_id; // NOT media_id — /artifacts/resolve only accepts artifact ids
-    if (!artifactId) continue;
-    if (att.size_bytes && att.size_bytes > MEDIA_MAX_BYTES) {
-      console.warn(`[openmax] attachment ${att.file_name || artifactId} exceeds ${MEDIA_MAX_BYTES}B, label only`);
-      continue;
-    }
-    try {
-      const media = await withTimeout<DownloadedMedia | null>(
-        (async () => {
-          const { url, contentType } = await st.as.getMediaUrl(artifactId);
-          if (!url) return null;
-          const buf = await st.http.getBytes(url);
-          const saved = await core.channel.media.saveMediaBuffer(
-            buf,
-            att.content_type || contentType || "",
-            "inbound",
-            MEDIA_MAX_BYTES,
-            att.file_name,
-          );
-          return saved?.path ? { path: saved.path, mime: saved.contentType || att.content_type || "" } : null;
-        })(),
-        null,
-        MEDIA_FETCH_TIMEOUT_MS,
-      );
-      if (media) out.push(media);
-    } catch (err: any) {
-      // Degrade to the [image]/[file] label — a failed download must never
-      // block message delivery.
-      console.warn(`[openmax] attachment download failed (${att.file_name || artifactId}): ${err?.message}`);
-    }
-  }
-  return out;
+  // Downloads run in parallel (each self-guarded by timeout + catch) so N slow
+  // or unavailable attachments cost one timeout window, not N — a serial loop
+  // here would stall the org's delivery pipeline for minutes.
+  const list = (attachments || []).slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+  const results = await Promise.all(
+    list.map(async (att): Promise<DownloadedMedia | null> => {
+      const artifactId = att?.artifact_id; // NOT media_id — /artifacts/resolve only accepts artifact ids
+      if (!artifactId) return null;
+      if (att.size_bytes && att.size_bytes > MEDIA_MAX_BYTES) {
+        console.warn(`[openmax] attachment ${att.file_name || artifactId} exceeds ${MEDIA_MAX_BYTES}B, label only`);
+        return null;
+      }
+      try {
+        return await withTimeout<DownloadedMedia | null>(
+          (async () => {
+            const { url, contentType } = await st.as.getMediaUrl(artifactId);
+            if (!url) return null;
+            const buf = await st.http.getBytes(url);
+            const saved = await core.channel.media.saveMediaBuffer(
+              buf,
+              att.content_type || contentType || "",
+              "inbound",
+              MEDIA_MAX_BYTES,
+              att.file_name,
+            );
+            return saved?.path ? { path: saved.path, mime: saved.contentType || att.content_type || "" } : null;
+          })(),
+          null,
+          MEDIA_FETCH_TIMEOUT_MS,
+        );
+      } catch (err: any) {
+        // Degrade to the [image]/[file] label — a failed download must never
+        // block message delivery.
+        console.warn(`[openmax] attachment download failed (${att.file_name || artifactId}): ${err?.message}`);
+        return null;
+      }
+    }),
+  );
+  return results.filter((m): m is DownloadedMedia => m !== null);
 }
 
 // ─── Bridge state ────────────────────────────────────────────
@@ -353,6 +360,8 @@ function withTimeout<T>(p: Promise<T>, fallback: T, ms = CONTEXT_FETCH_TIMEOUT_M
   ]);
 }
 
+const MAX_MEMBER_NAME_CACHE = 500;
+
 async function resolveMemberName(st: BridgeState, orgId: string, memberId: string): Promise<string | null> {
   if (!memberId) return null;
   const cached = st.memberNames.get(memberId);
@@ -360,7 +369,15 @@ async function resolveMemberName(st: BridgeState, orgId: string, memberId: strin
   try {
     const m = await st.http.getForOrg(orgId, st.http.apiPath(`/members/${memberId}`));
     const name = m?.display_name || m?.username || null;
-    if (name) st.memberNames.set(memberId, name);
+    if (name) {
+      // Bound the cache: a long-running gateway in a high-churn workspace must
+      // not grow it forever. Insertion-order eviction (Map preserves order).
+      if (st.memberNames.size >= MAX_MEMBER_NAME_CACHE) {
+        const oldest = st.memberNames.keys().next().value;
+        if (oldest !== undefined) st.memberNames.delete(oldest);
+      }
+      st.memberNames.set(memberId, name);
+    }
     return name;
   } catch {
     return null;
@@ -486,12 +503,12 @@ async function deliverInbound(msg: any, _endpoint: string, priority?: 1 | 2 | 3)
   const rawText = labelMedia(escapeXml(msg.text || ""), msg.type || "", msg.attachments || []);
   const content = buildInboundBody(rawText, blocks);
 
-  // Download inbound media (current message + quoted) so the vision model can
-  // actually see it — the [image] label in the body is only a caption.
-  const media = await downloadAttachments(st, core, msg.attachments || []);
-  if (blocks.quoted?.attachments?.length) {
-    media.push(...(await downloadAttachments(st, core, blocks.quoted.attachments)));
-  }
+  // Download inbound media (current message + quoted, one parallel batch) so
+  // the vision model can actually see it — the [image] label is only a caption.
+  const media = await downloadAttachments(st, core, [
+    ...(msg.attachments || []),
+    ...(blocks.quoted?.attachments || []),
+  ]);
 
   const from = `openmax:${msg.senderId || "unknown"}`;
   const to = `openmax:${ACCOUNT_ID}`;
@@ -620,9 +637,10 @@ async function sendOutbound(
 }
 
 // ─── Bridge lifecycle ────────────────────────────────────────
+// SDK ≥ alpha.2 keys orgs by org_id everywhere (slug removed) — session/ledger
+// storage keys and callback identities all carry the org UUID.
 function buildOrgConfig(acct: OpenMaxChannelConfig): any {
   return {
-    slug: ACCOUNT_ID,
     org_id: acct.orgId,
     ...(acct.orgName ? { org_name: acct.orgName } : {}),
     self: {
@@ -692,7 +710,28 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
     logger,
   });
 
-  const sessionFile = (slug: string) => path.join(dataDir, `session-${slug}.json`);
+  const sessionFile = (orgId: string) => path.join(dataDir, `session-${orgId}.json`);
+
+  // One-time migration from the pre-alpha.2 slug-keyed stores ("default") to
+  // org_id-keyed: rename the session file and the ledger key inside kv.json so
+  // the cursor/watermark survive the SDK upgrade instead of re-seeking.
+  try {
+    const oldSession = path.join(dataDir, "session-default.json");
+    if (acct.orgId && fs.existsSync(oldSession) && !fs.existsSync(sessionFile(acct.orgId))) {
+      fs.renameSync(oldSession, sessionFile(acct.orgId));
+      console.log(`[openmax] migrated session-default.json → session-${acct.orgId}.json`);
+    }
+    const kvFile = path.join(dataDir, "kv.json");
+    const kv = readJson(kvFile);
+    if (acct.orgId && kv && kv["inbox-default.json"] !== undefined && kv[`inbox-${acct.orgId}.json`] === undefined) {
+      kv[`inbox-${acct.orgId}.json`] = kv["inbox-default.json"];
+      delete kv["inbox-default.json"];
+      writeJson(kvFile, kv);
+      console.log(`[openmax] migrated inbox-default.json → inbox-${acct.orgId}.json`);
+    }
+  } catch (err: any) {
+    console.warn(`[openmax] slug→org_id store migration failed: ${err?.message}`);
+  }
 
   const bridge = new CwsAgentBridge({
     http,
@@ -708,9 +747,9 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
       // Cursor recovery lives in the SDK now (issues #4/#5: the orchestrator
       // seeds/clamps sync_seq from the ledger's durable acked_seq, and gap
       // sweeps floor at the watermark) — the plugin just persists the session.
-      loadSession: (slug: string) => readJson(sessionFile(slug)) || {},
-      saveSession: (slug: string, partial: any) => {
-        writeJson(sessionFile(slug), { ...(readJson(sessionFile(slug)) || {}), ...partial });
+      loadSession: (orgId: string) => readJson(sessionFile(orgId)) || {},
+      saveSession: (orgId: string, partial: any) => {
+        writeJson(sessionFile(orgId), { ...(readJson(sessionFile(orgId)) || {}), ...partial });
       },
       // Self-name hydration barrier: fetch the authoritative display_name so
       // text "@Name" mention detection matches what cws-fe renders. Without
@@ -730,7 +769,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
         }
       },
       // member_id write-back backfill source for the hydrator.
-      loadConfig: () => ({ orgs: { [ACCOUNT_ID]: orgConfig } }),
+      loadConfig: () => ({ orgs: { [acct.orgId || ""]: orgConfig } }),
       onOwnerBind: (_slug: string, memberId: string, displayName: string) => {
         orgConfig.owner = { member_id: memberId, name: displayName || "" };
         void persistOwner(memberId, displayName);
@@ -740,7 +779,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
         void persistOwner(orgConfig.owner.member_id, name);
       },
       onOrgTerminated: (org: any, code: number, reason: string) => {
-        log?.error?.(`openmax: org ${org?.slug} terminated code=${code} reason="${reason || ""}"`);
+        log?.error?.(`openmax: org ${org?.org_id} terminated code=${code} reason="${reason || ""}"`);
       },
     },
     reporters: { version: "0.1.0" },
