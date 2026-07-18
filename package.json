@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/coco-xyz/openclaw-openmax.git"
+    "url": "https://github.com/openmaxai/openclaw-openmax.git"
   },
   "keywords": [
     "openclaw",
@@ -18,5 +18,7 @@
     "websocket"
   ],
   "author": "Coco AI (https://github.com/coco-xyz)",
-  "dependencies": {}
+  "dependencies": {
+    "@openmaxai/openmax-agent-sdk": "0.1.0-alpha.2"
+  }
 }
