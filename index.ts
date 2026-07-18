@@ -194,8 +194,9 @@ function buildInboundBody(text: string, blocks: ContextBlocks): string {
   return parts.join("\n\n");
 }
 
-/** Label media messages so an image/file isn't delivered as an empty body.
- *  MVP: label only; attachment download is a post-MVP alignment item.
+/** Body caption for media messages so an image/file isn't delivered as an
+ *  empty body. The actual attachment bytes reach the model via ctx.MediaPaths
+ *  (downloadAttachments); when a download fails, this label is the fallback.
  *  `text` must already be escaped by the caller; file_name is escaped here. */
 function labelMedia(text: string, msgType: string, attachments: any[]): string {
   const first = Array.isArray(attachments) ? attachments[0] : null;
