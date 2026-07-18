@@ -22,25 +22,25 @@ openclaw-openmax is an OpenClaw channel plugin (Category A protocol bridge). Its
 - **DM**: `dmPolicy` = `owner` (default) / `open` / `allowlist`. In `owner` mode the first-ever DM auto-binds the sender as owner; non-owner senders are rejected with a polite notice.
 - **Group**: `groupPolicy` = `allowlist` (default) / `open` / `disabled`. Allowlist is keyed by `access.groups[conversationId]`; **an owner @mention bypasses the allowlist gate**.
 - **Per-group config**: `groups[convId] = { name, mode, allowFrom }`. Empty `allowFrom` or `*` means everyone; the owner is exempt from `allowFrom`.
-- **Response mode**: `mode` = `mention` (default — respond only when @mentioned) / `smart` (receive all messages, inject a `<smart-mode>` hint so the model decides; replying `[SKIP]` stays silent — the outbound path intercepts it and sends nothing). When directly @mentioned, the smart hint is NOT injected — answer directly.
+- **Response mode**: `mode` = `mention` (default — respond only when @mentioned) / `smart` (receive all messages, inject a `<smart-mode>` hint so the model decides; replying `[SKIP]` stays silent — the outbound path intercepts it and sends nothing) / `silent` (context only, never wakes the agent; semantics confirmed via SDK issue #7). When directly @mentioned, the smart hint is NOT injected — answer directly.
 - **Dual-path mention detection**: structured `mentions[]` (`entity_id`) plus a text fallback `@<selfName>(?![\w-])`. The server often returns raw text without a structured mentions array; without the fallback the mention gate never fires in practice.
-- **Reject notices**: in groups, reply with a refusal only when the sender actually @mentioned us (otherwise stay silent — replying to background traffic is spam); DM rejections always notify; **sync-replay frames and AGENT senders never get notices** (avoids spamming stale apologies after a fix, and agent-to-agent reject ping-pong).
+- **Reject notices** (sent by the SDK orchestrator): in groups, reply with a refusal only when the sender actually @mentioned us (otherwise stay silent — replying to background traffic is spam); DM rejections always notify; **sync-replay frames and AGENT senders never get notices** (avoids spamming stale apologies after a fix, and agent-to-agent reject ping-pong).
 - **Self-echo**: drop messages where `sender_id == self.member_id`.
 - **System Members**: `sender_type=SYSTEM` (approval center, scheduler, and other platform signals) bypasses all policy gates and carries a priority (urgent/high/normal) mapped onto delivery priority.
 
 ### Context building (aligned with formatInboundForC4)
 
 - **Group context**: fetch the N messages (default 5) before the current message's seq (`before_seq`), sort ascending, resolve each sender's display name (process-level cache), wrap in a `<group-context>` block.
-- **Quoted reply**: when `parent_id` is present, fetch the quoted message and wrap it in `<replying-to>`; quoted media must be downloaded and its local path appended (a caption-less quoted image would otherwise drop the whole quote).
-- **Threads**: when `thread_id` is present, wrap history in `<thread-context>` with the root message tagged `<thread-root>`; thread context takes precedence over the quote block.
-- **Media**: attachments carry `attachments[].artifact_id` (**must be the cws-as artifact_id, NOT the media_id** — using the wrong one leaves the FE spinner loading forever; zylos side hit this). Resolve to a URL, download locally, label the body `[image]` / `[file: name]`, and append `---- image/file: <local path>`.
+- **Quoted reply**: when `parent_id` is present, fetch the quoted message and wrap it in `<replying-to>`; quoted attachments download in the same parallel batch as the current message into `ctx.MediaPaths`, and a caption-less quoted image/file is represented by an `[image]` / `[file: name]` label inside the block (otherwise the whole quote would drop).
+- **Threads** (post-MVP, not implemented): the zylos reference behavior wraps history in `<thread-context>` with the root tagged `<thread-root>`, taking precedence over the quote block; the current implementation only routes thread conversations by endpoint and builds no thread-context block.
+- **Media**: attachments carry `attachments[].artifact_id` (**must be the cws-as artifact_id, NOT the media_id** — using the wrong one leaves the FE spinner loading forever; zylos side hit this). Resolve the presigned URL, download through `saveMediaBuffer` into an OpenClaw media root, and hand the files to the model via **`ctx.MediaPaths`** (OpenClaw never reads a path mentioned in the body text); the body carries only the `[image]` / `[file: name]` caption, which doubles as the fallback when a download fails.
 - **Structural-breakout guard**: user text embedded in XML-tagged blocks escapes only `<` / `>` (enough to block a literal `</current-message>` breakout; `&` and quotes stay verbatim for readability).
 
 ### Conversation type and state
 
 - WS frames don't carry the conversation type; fetch `GET /conversations/{id}` once via REST and cache it.
-- Message dedup: 5-minute TTL.
-- **Seq persistence + reconnect catch-up**: persist `last_seq` per account; after reconnect, `POST /sync` (page size 100, per-sweep cap 2000; overflow resumes on the next reconnect). This is what makes "messages are never silently lost" true.
+- Message dedup: the SDK message-id deduper (count-based, most recent 5000 ids) plus the inbox-ledger reserve/commit (ack only on genuine delivery).
+- **Seq persistence + reconnect catch-up**: persist a per-org `sync_seq` cursor (keyed by org_id); after reconnect, `POST /sync` (page size 100, per-sweep cap 2000; overflow resumes on the next reconnect), and the SDK seeds a missing/stale cursor from the ledger watermark. This is what makes "messages are never silently lost" true.
 
 ## Outbound (aligned with zylos send.js)
 
@@ -48,23 +48,23 @@ openclaw-openmax is an OpenClaw channel plugin (Category A protocol bridge). Its
 - Types: agent text uses `AGENT_TEXT`; a markdown heuristic picks the `content_type`.
 - **Mention canonicalization**: cws-fe highlights mentions purely by matching the literal text `@<exact display_name>`. Inbound processing records participant display names per conversation (cap 200, persisted registry); outbound rewrites `@name` tokens to the exact recorded name (longest-first).
 - `[SKIP]` sentinel: in smart mode the model outputs `[SKIP]` to stay silent; outbound intercepts it as a no-op.
-- Media: `[MEDIA:image|file]<path>` prefix → upload via cws-as → attachment carries `artifact_id`, `file_name`, `content_type` (never drop the MIME — the FE can't render without it).
+- Media (post-MVP, not implemented): the zylos reference behavior is a `[MEDIA:image|file]<path>` prefix → upload via cws-as → attachment carries `artifact_id`, `file_name`, `content_type` (never drop the MIME — the FE can't render without it).
 
 ## Capability alignment matrix (zylos-openmax → openclaw-openmax)
 
 | zylos-openmax capability | Lands in | Notes |
 |---|---|---|
 | WS connect / heartbeat / exponential backoff | SDK | SDK responsibility per plan §2 |
-| api_key → JWT → ws-ticket auth chain | SDK | On 4003 session-expired, invalidate only the token cache; keep last_seq |
+| api_key → JWT → ws-ticket auth chain | SDK | On 4003 session-expired, invalidate only the token cache; the sync cursor is kept |
 | Seq persistence + /sync reconnect catch-up | **SDK (confirmed)** | SyncEngine + inbox-ledger; cursor persisted via loadSession/saveSession callbacks into plugin storage |
-| Message dedup (5-min TTL) | **SDK (confirmed)** | inbox-ledger reserve/commit; ack only on genuine delivery |
+| Message dedup | **SDK (confirmed)** | message-id deduper (count-based) + inbox-ledger reserve/commit; ack only on genuine delivery |
 | client_msg_id idempotency | SDK | |
 | Conversation / member-name lookup + cache | SDK (conversation) + plugin (member names) | The orchestrator fetches the conversation; member-name resolution reads `InboundMessage.message` in the plugin |
 | DM/group access policy + owner auto-bind | **SDK `decideInbound`** + plugin persistence | Decision rides on InboundMessage; auto-bind persisted by the plugin via `onOwnerBind`; group mode includes `silent`; same-owner sibling-agent DM exemption |
 | mention/smart mode + `[SKIP]` | SDK decides + plugin executes | `decision.mode/mentioned` come from the SDK; smart-hint injection and `[SKIP]` interception stay in the plugin |
-| Group-context / quote / thread blocks | Plugin | |
-| Media download/upload (artifact_id) | Plugin + SDK (as capability) | Howard approved SDK scope incl. tm/kb/as CLIs |
-| Reject notices (incl. do-not-disturb rules) | Plugin | |
+| Group-context / quote blocks | Plugin | Thread-context block is post-MVP (endpoint routing only) |
+| Media download/upload (artifact_id) | Plugin + SDK (as capability) | Inbound implemented (`ctx.MediaPaths`); outbound `[MEDIA:]` upload post-MVP |
+| Reject notices (incl. do-not-disturb rules) | **SDK orchestrator** | On a policy drop carrying a userNotice, the SDK posts the AGENT_TEXT refusal |
 | System Member priority | Plugin | Mapped onto OpenClaw QueueMode — see the System Member priority section |
 | Outbound mention canonicalization registry | **SDK `createMentionRegistry`** (absorbed per issue #8) | The plugin injects a StorageProvider and calls it on inbound (record names) / outbound (canonicalize) |
 | Markdown detection + 3000-char chunking | Plugin | OpenClaw `textChunkLimit` covers part of it |
@@ -97,7 +97,7 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 
 ## Open questions (blockers in bold)
 
-1. **SDK reviewed and accepted** ([openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) PR#1, full extraction, +11k lines incl. orchestrator/schemas/fixtures) — outcomes of last round's four asks: ① `InboundMessage` requires `senderType` (HUMAN/AGENT/SYSTEM) and carries `priority` (1/2/3) passed as the third arg of `deliver(msg, endpoint, priority)` — our QueueMode mapping input is covered; ② outbound: client_msg_id / markdown detection / `splitMessage(3000)` are all in the SDK (the plugin must call chunking itself); media `uploadMedia` returns artifactId, attachment assembly stays in the plugin; ③ access policy lives in SDK `decideInbound` (pure function), the decision (mode/mentioned/groupCfg/bindOwnerHint) rides on the InboundMessage, group mode gains `silent`, plus a same-owner sibling-agent DM exemption; owner auto-bind became the `onOwnerBind` callback with the plugin persisting it; ④ last_seq / ledger / dedup / token persistence all go through StorageProvider + loadSession/saveSession. The mention-canonicalization registry has been absorbed into the SDK (issue #8 → `createMentionRegistry`) and the plugin now uses it. SDK issues #4/#5 (cursor recovery / gap-sweep floor) are fixed and the plugin-side workaround has been removed.
+1. ~~SDK interface and ownership boundary~~ **Resolved**: [openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) provides the InboundMessage (with senderType + priority), the `decideInbound` policy, sync/ledger cursor recovery (issues #4/#5), and `createMentionRegistry` (issue #8); the sections and capability matrix in this document are the authoritative description of the current split.
 2. Repo home github.com/openmaxai/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
 3. `queueModeOverride` is an OpenClaw-internal type field (works at runtime): the connectivity test must cover it (decision: no OpenClaw issue — the behavior is pinned by our test).
 
