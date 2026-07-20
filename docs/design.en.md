@@ -1,6 +1,6 @@
 # openclaw-openmax Integration Design
 
-Status: implemented and verified end-to-end against a live CWS environment (cws-int); SDK = npm `@openmaxai/openmax-agent-sdk@0.1.0-alpha.2`.
+Status: implemented and verified end-to-end against a live CWS environment (cws-int); SDK = npm `@openmaxai/openmax-agent-sdk@^1.0.0`.
 Upstream plan: OpenMax Agent Runtime Integration Plan v1 (approved by Howard, 2026-07-17).
 中文版: [design.md](./design.md)
 
@@ -104,7 +104,7 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 ## MVP in five steps (per plan §8)
 
 1. ✅ Repo init (README / package.json / plugin manifest / index.ts / CI)
-2. ✅ CWS connection + auth — via the SDK `CwsAgentBridge` (dependency: npm `@openmaxai/openmax-agent-sdk`, tracking the alpha line)
+2. ✅ CWS connection + auth — via the SDK `CwsAgentBridge` (dependency: npm `@openmaxai/openmax-agent-sdk@^1.0.0`, stable)
 3. ✅ Inbound: SDK policy filter → group-context/quote/smart-hint blocks → OpenClaw session (incl. priority → queueModeOverride mapping; silent mode records context only)
 4. ✅ Outbound: `[SKIP]` interception → mention canonicalization → `splitMessage(3000)` chunking → bridge.send (parent_id on the first chunk only)
 5. ✅ Bidirectional connectivity test — verified on cws-int: DM round-trip, owner auto-bind persistence, group gating (allowlist / @bypass / smart / `[SKIP]`), image + file attachments, reply chunking, disconnect + /sync catch-up with cursor recovery; queueModeOverride still needs a platform SYSTEM-message scenario
