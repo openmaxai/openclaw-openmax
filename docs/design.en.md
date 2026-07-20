@@ -98,7 +98,7 @@ Delivery confirmation must be truthful: a message counts as delivered only when 
 ## Open questions (blockers in bold)
 
 1. ~~SDK interface and ownership boundary~~ **Resolved**: [openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) provides the InboundMessage (with senderType + priority), the `decideInbound` policy, sync/ledger cursor recovery (issues #4/#5), and `createMentionRegistry` (issue #8); the sections and capability matrix in this document are the authoritative description of the current split.
-2. Repo home github.com/openmaxai/openclaw-openmax: repo creation + main branch protection (PR approval + green CI required) needs someone with permissions.
+2. ~~Repo home~~ **Resolved**: github.com/openmaxai/openclaw-openmax exists with main branch protection active (PR approval + green CI required).
 3. `queueModeOverride` is an OpenClaw-internal type field (works at runtime): the connectivity test must cover it (decision: no OpenClaw issue — the behavior is pinned by our test).
 
 ## MVP in five steps (per plan §8)

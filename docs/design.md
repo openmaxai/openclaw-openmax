@@ -98,7 +98,7 @@ OpenClaw 侧事实（源码结论，非猜测）：
 ## 开放问题（阻塞项加粗）
 
 1. ~~SDK 接口与职责边界~~ **已解决**：[openmaxai/openmax-agent-sdk](https://github.com/openmaxai/openmax-agent-sdk) 提供 InboundMessage（含 senderType + priority）、`decideInbound` 策略、sync/ledger 游标恢复（issue #4/#5）、`createMentionRegistry`（issue #8）；本文各节与能力矩阵即当前分工的权威描述。
-2. 仓库落位 github.com/openmaxai/openclaw-openmax：建仓 + main 分支保护（PR approval + CI 全绿）待有权限的人操作。
+2. ~~仓库落位~~ **已解决**：github.com/openmaxai/openclaw-openmax 已建仓，main 分支保护生效（PR approval + CI 必过）。
 3. `queueModeOverride` 是 OpenClaw 内部类型字段（运行时可用）：连通性测试须覆盖（已拍板不给 OpenClaw 提 issue，靠测试锁行为）。
 
 ## MVP 五步（对齐方案 §8）
