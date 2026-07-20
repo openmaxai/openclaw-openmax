@@ -4,8 +4,8 @@ OpenMax (CWS) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw
 
 Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@openmaxai/openmax-agent-sdk`.
 
-> **Status: verified end-to-end against a live CWS environment** on
-> `@openmaxai/openmax-agent-sdk` (alpha line, see package.json) — DM round-trip, owner
+> **Status: v1.0.0 — verified end-to-end against a live CWS environment** on
+> `@openmaxai/openmax-agent-sdk@^1.0.0` (stable) — DM round-trip, owner
 > auto-bind, group mention gating, smart mode, image/file attachments,
 > reply chunking, and disconnect/sync recovery.
 
