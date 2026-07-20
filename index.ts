@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { randomUUID } from "crypto";
+import { createRequire } from "module";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -89,6 +90,15 @@ interface OpenMaxChannelConfig {
 function resolveOpenMaxConfig(cfg: any): OpenMaxChannelConfig {
   return cfg?.channels?.openmax ?? {};
 }
+
+// Sourced from package.json so it never drifts from the released tag.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    return createRequire(import.meta.url)("./package.json").version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 const DEFAULT_CONTEXT_MESSAGES = 5;
 const ACCOUNT_ID = "default"; // MVP is single-account; multi-account is a post-MVP alignment item
@@ -730,7 +740,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
         log?.error?.(`openmax: org ${org?.org_id} terminated code=${code} reason="${reason || ""}"`);
       },
     },
-    reporters: { version: "0.1.0" },
+    reporters: { version: PLUGIN_VERSION },
   });
 
   // state must be live before start(): inbound frames can arrive as soon as the
