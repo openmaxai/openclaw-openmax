@@ -1,6 +1,6 @@
 {
   "name": "openclaw-openmax",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenMax (CWS) channel plugin for OpenClaw - agent messaging via CWS WebSocket",
   "main": "index.ts",
   "license": "MIT",
