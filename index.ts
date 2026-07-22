@@ -27,6 +27,7 @@ import {
 // in helpers.ts so they run under `node --test` without the OpenClaw host.
 import {
   type ContextBlocks,
+  applyConfigEvent,
   buildInboundBody,
   escapeXml,
   isSkipReply,
@@ -242,7 +243,16 @@ interface BridgeState {
   comm: any;
   orgConfig: any;
   memberNames: Map<string, string>;
+  ownerSyncTimer?: ReturnType<typeof setInterval>;
 }
+
+// Periodic owner + self-display-name pull from cws-core. The event-driven path
+// (owner_changed → syncOwnerFromCore) covers live edits; this timer is the
+// heal-on-a-schedule safety net that mirrors zylos-openmax's 5-min
+// `owner-config-sync` task (comm-bridge.js periodicSync) — it also lets the
+// display_name hydrate once member_id is written back if the WS-open barrier
+// missed it. The SDK arms no owner timer of its own.
+const OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 let state: BridgeState | null = null;
 
@@ -296,6 +306,25 @@ async function persistOwner(memberId: string, name: string): Promise<void> {
   }
 }
 
+// Persist the access policy (dmPolicy/dmAllowFrom/groupPolicy/groups) to
+// config.json. Mirrors persistOwner: clone the LIVE shared snapshot before
+// mutating so a failed write can't corrupt other consumers. Called after an
+// agent.config.* access event has already mutated the live orgConfig.access
+// (which the SDK's decideInbound gate reads) — this makes the edit survive a
+// restart; the live mutation is what makes it take effect immediately.
+async function persistAccess(access: OpenMaxAccessConfig): Promise<void> {
+  const runtime = getRuntime() as any;
+  try {
+    const loaded = runtime.config.current?.() ?? (await runtime.config.loadConfig());
+    const cfg = structuredClone(loaded ?? {});
+    const openmax = ((cfg.channels ||= {}).openmax ||= {});
+    openmax.access = structuredClone(access);
+    await runtime.config.writeConfigFile(cfg);
+  } catch (err: any) {
+    console.error(`[openmax] access persist failed: ${err?.message}`);
+  }
+}
+
 // ─── Inbound: CWS → OpenClaw session ─────────────────────────
 // The SDK http client has no request timeout; context fetches degrade to their
 // fallback instead of stalling the org's delivery pipeline on a hung request.
@@ -332,6 +361,88 @@ async function resolveMemberName(st: BridgeState, orgId: string, memberId: strin
   } catch {
     return null;
   }
+}
+
+// ─── Owner sync from cws-core (SDK onConfigEvent owner_changed + periodic) ───
+// Port of zylos-openmax comm-bridge.js syncOwnerFromCore. Fetches this agent's
+// own member record and reconciles two authoritative fields into the LIVE
+// orgConfig the SDK gate reads (decideInbound): self.display_name (drives text
+// @-mention matching) and owner_member_id. INVARIANT (from source): never CLEAR
+// a local owner when core reports none — that preserves the SDK's first-DM
+// auto-bind fallback (decideInbound bindOwnerHint → onOwnerBind). Persists via
+// the existing persistOwner path; best-effort, never throws.
+async function syncOwnerFromCore(orgConfig: any): Promise<void> {
+  const st = state;
+  if (!st) return;
+  const selfMemberId = orgConfig?.self?.member_id;
+  // member_id is written back by the token exchange (onMemberId); if it isn't
+  // there yet, skip this round — the next periodic tick / reconnect retries.
+  if (!selfMemberId) return;
+
+  let member: any;
+  try {
+    member = await st.http.getForOrg(orgConfig.org_id, st.http.apiPath(`/members/${selfMemberId}`));
+  } catch (err: any) {
+    console.warn(`[openmax] owner-sync: fetch self member failed: ${err?.message} — keeping local owner`);
+    return;
+  }
+
+  // Authoritative self display_name: sync into the live orgConfig so the SDK's
+  // text @-mention detection matches what cws-fe renders (no config.json field
+  // for self exists in this plugin — it is hydrated from core, so live-only).
+  const coreDisplayName = member?.display_name || "";
+  if (coreDisplayName && coreDisplayName !== orgConfig.self?.display_name) {
+    orgConfig.self = { ...(orgConfig.self || {}), display_name: coreDisplayName, name: coreDisplayName };
+    console.log(`[openmax] self display_name synced from core: ${coreDisplayName}`);
+  }
+
+  const coreOwnerId = member?.owner_member_id || "";
+  // Core has no authoritative owner → leave the local binding as-is (never
+  // clear) so the first-DM auto-bind fallback keeps working.
+  if (!coreOwnerId) return;
+  const localOwnerId = orgConfig.owner?.member_id || "";
+  if (coreOwnerId === localOwnerId) return; // already in sync
+
+  let ownerName = "";
+  try {
+    ownerName = (await resolveMemberName(st, orgConfig.org_id, coreOwnerId)) || "";
+  } catch {
+    /* display name is cosmetic */
+  }
+
+  // Update the live orgConfig in place (the gate sees the new owner without a
+  // restart) and persist to config.json via the existing owner-write path.
+  orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
+  console.log(`[openmax] owner synced from core: ${localOwnerId || "(none)"} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}`);
+  await persistOwner(coreOwnerId, ownerName);
+}
+
+// SDK onConfigEvent seam: the bridge classifies agent.config.* system frames,
+// applies the "not for us" target check, and hands us { event, data }. We mutate
+// the SAME orgConfig object the SDK's decideInbound gate reads (live effect,
+// no restart) and persist for durability. owner_changed is routed to
+// syncOwnerFromCore; the six access events go through the pure applyConfigEvent.
+async function handleConfigEvent(orgConfig: any, evt: { event: string; data: any }): Promise<void> {
+  const { event, data } = evt;
+
+  if (event === "agent.config.owner_changed") {
+    const oldOwner = data?.old_owner_member_id;
+    const newOwner = data?.new_owner_member_id;
+    console.log(`[openmax] owner_changed event: ${oldOwner || "(none)"} → ${newOwner || "(none)"} by=${data?.changed_by || "?"} reason=${data?.reason || "?"}`);
+    await syncOwnerFromCore(orgConfig);
+    return;
+  }
+
+  orgConfig.access = orgConfig.access || {};
+  const result = applyConfigEvent(orgConfig.access, event, data);
+  if (!result.applied) {
+    console.warn(`[openmax] config event ${event} not applied: ${result.note}`);
+    return;
+  }
+  console.log(`[openmax] config updated: ${result.summary} (by ${data?.changed_by || "?"})`);
+  // Live effect is already done (mutated orgConfig.access in place). Persist so
+  // the edit survives a restart.
+  await persistAccess(orgConfig.access);
 }
 
 async function fetchGroupContext(
@@ -736,6 +847,10 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
         orgConfig.owner.name = name;
         void persistOwner(orgConfig.owner.member_id, name);
       },
+      // agent.config.* platform events (page/admin policy edits + owner_changed).
+      // The SDK classifies + target-checks the frame and hands us {event,data};
+      // handleConfigEvent mutates this same orgConfig live and persists.
+      onConfigEvent: (oc: any, evt: { event: string; data: any }) => handleConfigEvent(oc, evt),
       onOrgTerminated: (org: any, code: number, reason: string) => {
         log?.error?.(`openmax: org ${org?.org_id} terminated code=${code} reason="${reason || ""}"`);
       },
@@ -760,6 +875,14 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
     await stopBridge(st);
     throw err;
   }
+  // Arm the periodic owner/display-name sync (event-driven path handles live
+  // owner_changed edits; this is the scheduled heal). unref so it never keeps
+  // the process alive; cleared in stopBridge.
+  st.ownerSyncTimer = setInterval(() => {
+    syncOwnerFromCore(orgConfig).catch((e: any) =>
+      console.warn(`[openmax] periodic owner-sync failed: ${e?.message}`));
+  }, OWNER_SYNC_INTERVAL_MS);
+  st.ownerSyncTimer.unref?.();
   return st;
 }
 
@@ -770,6 +893,10 @@ async function stopBridge(target?: BridgeState): Promise<void> {
   const st = target ?? state;
   if (!st) return;
   if (state === st) state = null;
+  if (st.ownerSyncTimer) {
+    clearInterval(st.ownerSyncTimer);
+    st.ownerSyncTimer = undefined;
+  }
   try {
     await st.bridge.stop();
   } catch {

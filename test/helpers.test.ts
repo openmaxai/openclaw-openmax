@@ -3,6 +3,8 @@ import { test } from "node:test";
 
 import {
   SMART_MODE_HINT,
+  type AccessLike,
+  applyConfigEvent,
   buildInboundBody,
   escapeXml,
   isSkipReply,
@@ -64,4 +66,75 @@ test("isSkipReply matches the [SKIP] sentinel only", () => {
   assert.equal(isSkipReply("  [SKIP]\n"), true);
   assert.equal(isSkipReply("[SKIP] but also text"), false);
   assert.equal(isSkipReply("skip"), false);
+});
+
+// ─── applyConfigEvent (agent.config.* → access mutation) ─────────────────────
+test("dm_policy_changed sets dmPolicy; invalid policy is rejected", () => {
+  const a: AccessLike = {};
+  assert.equal(applyConfigEvent(a, "agent.config.dm_policy_changed", { policy: "open" }).applied, true);
+  assert.equal(a.dmPolicy, "open");
+  const bad = applyConfigEvent(a, "agent.config.dm_policy_changed", { policy: "nonsense" });
+  assert.equal(bad.applied, false);
+  assert.equal(a.dmPolicy, "open"); // unchanged
+});
+
+test("dm_allowlist_changed add/remove/set mutate dmAllowFrom", () => {
+  const a: AccessLike = {};
+  applyConfigEvent(a, "agent.config.dm_allowlist_changed", { action: "add", member_ids: ["u1", "u2"] });
+  assert.deepEqual(a.dmAllowFrom, ["u1", "u2"]);
+  // add is idempotent (no duplicates)
+  applyConfigEvent(a, "agent.config.dm_allowlist_changed", { action: "add", member_ids: ["u2", "u3"] });
+  assert.deepEqual(a.dmAllowFrom, ["u1", "u2", "u3"]);
+  applyConfigEvent(a, "agent.config.dm_allowlist_changed", { action: "remove", member_ids: ["u1"] });
+  assert.deepEqual(a.dmAllowFrom, ["u2", "u3"]);
+  applyConfigEvent(a, "agent.config.dm_allowlist_changed", { action: "set", member_ids: ["z"] });
+  assert.deepEqual(a.dmAllowFrom, ["z"]);
+  assert.equal(applyConfigEvent(a, "agent.config.dm_allowlist_changed", { action: "add", member_ids: [] }).applied, false);
+});
+
+test("group_mode_changed sets mode; silent removes the group entry", () => {
+  const a: AccessLike = {};
+  applyConfigEvent(a, "agent.config.group_mode_changed", { conversation_id: "g1", mode: "smart" });
+  assert.equal(a.groups?.g1.mode, "smart");
+  assert.deepEqual(a.groups?.g1.allowFrom, ["*"]);
+  applyConfigEvent(a, "agent.config.group_mode_changed", { conversation_id: "g1", mode: "silent" });
+  assert.equal(a.groups?.g1, undefined);
+  assert.equal(applyConfigEvent(a, "agent.config.group_mode_changed", { mode: "mention" }).applied, false);
+});
+
+test("group_allowfrom_changed replaces the per-group allowFrom", () => {
+  const a: AccessLike = { groups: { g1: { mode: "smart", allowFrom: ["*"] } } };
+  applyConfigEvent(a, "agent.config.group_allowfrom_changed", { conversation_id: "g1", allow_from: ["u1"] });
+  assert.deepEqual(a.groups?.g1.allowFrom, ["u1"]);
+  assert.equal(a.groups?.g1.mode, "smart"); // mode preserved
+  // creates a defaulted entry for an unknown group
+  applyConfigEvent(a, "agent.config.group_allowfrom_changed", { conversation_id: "g2", allow_from: ["x"] });
+  assert.equal(a.groups?.g2.mode, "mention");
+});
+
+test("group_scope_changed sets groupPolicy; invalid scope rejected", () => {
+  const a: AccessLike = {};
+  assert.equal(applyConfigEvent(a, "agent.config.group_scope_changed", { scope: "disabled" }).applied, true);
+  assert.equal(a.groupPolicy, "disabled");
+  assert.equal(applyConfigEvent(a, "agent.config.group_scope_changed", { scope: "bogus" }).applied, false);
+});
+
+test("group_allowlist_changed add/remove/set manage the groups map", () => {
+  const a: AccessLike = {};
+  applyConfigEvent(a, "agent.config.group_allowlist_changed", { action: "add", conversation_ids: ["g1", "g2"] });
+  assert.deepEqual(Object.keys(a.groups || {}).sort(), ["g1", "g2"]);
+  applyConfigEvent(a, "agent.config.group_allowlist_changed", { action: "remove", conversation_ids: ["g1"] });
+  assert.deepEqual(Object.keys(a.groups || {}), ["g2"]);
+  // set keeps existing config for retained ids, drops the rest
+  a.groups!.g2.mode = "smart";
+  applyConfigEvent(a, "agent.config.group_allowlist_changed", { action: "set", conversation_ids: ["g2", "g3"] });
+  assert.equal(a.groups?.g2.mode, "smart");
+  assert.equal(a.groups?.g3.mode, "mention");
+});
+
+test("owner_changed and unknown events are not access mutations", () => {
+  const a: AccessLike = { dmPolicy: "owner" };
+  assert.equal(applyConfigEvent(a, "agent.config.owner_changed", {}).applied, false);
+  assert.equal(applyConfigEvent(a, "agent.config.some_future_event", {}).applied, false);
+  assert.deepEqual(a, { dmPolicy: "owner" }); // untouched
 });
