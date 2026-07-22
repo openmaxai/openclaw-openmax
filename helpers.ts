@@ -197,3 +197,41 @@ export function applyConfigEvent(access: AccessLike, event: string, data: any): 
       return { applied: false, note: `not an access event: ${event}` };
   }
 }
+
+// ─── Reverse-direction policy push (local access → cws-comm reported-policy) ──
+// Port of zylos-openmax comm-bridge.js syncConfigToComm payload shaping
+// (src/comm-bridge.js:1894-1900). The agent pushes its local DM/group policy to
+// cws-comm so the server reflects offline config.json edits / a fresh install's
+// pre-populated policy. This is a PURE payload builder; index.ts does the
+// PUT /agents/{memberId}/reported-policy. Defaults mirror zylos exactly
+// (dmPolicy → 'owner', groupPolicy → 'allowlist', per-group mode → 'mention',
+// allowFrom → ['*']).
+export interface ReportedPolicyPayload {
+  dm_policy: string;
+  dm_allowlist: string[];
+  group_scope: string;
+  group_allowlist: string[];
+  groups: Array<{ conversation_id: string; mode: string; allow_from: string[] }>;
+}
+
+export function buildReportedPolicy(access: AccessLike): ReportedPolicyPayload {
+  const groups: ReportedPolicyPayload["groups"] = [];
+  const groupAllowlist: string[] = [];
+  if (access.groups) {
+    for (const [convId, gcfg] of Object.entries(access.groups)) {
+      groupAllowlist.push(convId);
+      groups.push({
+        conversation_id: convId,
+        mode: gcfg.mode || "mention",
+        allow_from: gcfg.allowFrom || ["*"],
+      });
+    }
+  }
+  return {
+    dm_policy: access.dmPolicy || "owner",
+    dm_allowlist: access.dmAllowFrom || [],
+    group_scope: access.groupPolicy || "allowlist",
+    group_allowlist: groupAllowlist,
+    groups,
+  };
+}

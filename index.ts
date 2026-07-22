@@ -29,6 +29,7 @@ import {
   type ContextBlocks,
   applyConfigEvent,
   buildInboundBody,
+  buildReportedPolicy,
   escapeXml,
   isSkipReply,
   labelMedia,
@@ -417,6 +418,31 @@ async function syncOwnerFromCore(orgConfig: any): Promise<void> {
   await persistOwner(coreOwnerId, ownerName);
 }
 
+// Reverse-direction policy push. Port of zylos-openmax comm-bridge.js
+// syncConfigToComm (src/comm-bridge.js:1875-1912): PUT the local access policy
+// to cws-comm's /agents/{memberId}/reported-policy so the server reflects
+// offline config.json edits or a fresh install's pre-populated policy. Called
+// from BOTH the periodic tick and the config-change epilogue, matching zylos's
+// two call sites (periodicSync + handleConfigUpdate). A 404 means the endpoint
+// isn't available on this cws-comm — skip quietly, exactly as zylos does.
+async function syncConfigToComm(orgConfig: any): Promise<void> {
+  const st = state;
+  if (!st) return;
+  const selfMemberId = orgConfig?.self?.member_id;
+  if (!selfMemberId) return;
+  const payload = buildReportedPolicy(orgConfig.access || {});
+  try {
+    await st.http.putForOrg(orgConfig.org_id, st.http.apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
+    console.log(`[openmax] policy reported: dmPolicy=${payload.dm_policy}, groupScope=${payload.group_scope}, groups=${payload.groups.length}`);
+  } catch (err: any) {
+    if (err?.status === 404) {
+      console.warn("[openmax] reported-policy endpoint not available (404), skipping");
+    } else {
+      console.warn(`[openmax] config sync to comm failed: ${err?.message}`);
+    }
+  }
+}
+
 // SDK onConfigEvent seam: the bridge classifies agent.config.* system frames,
 // applies the "not for us" target check, and hands us { event, data }. We mutate
 // the SAME orgConfig object the SDK's decideInbound gate reads (live effect,
@@ -443,6 +469,10 @@ async function handleConfigEvent(orgConfig: any, evt: { event: string; data: any
   // Live effect is already done (mutated orgConfig.access in place). Persist so
   // the edit survives a restart.
   await persistAccess(orgConfig.access);
+  // Immediately report the updated policy back to cws-comm so the server
+  // reflects the change without waiting for the periodic tick (mirrors zylos's
+  // handleConfigUpdate epilogue, comm-bridge.js:1300). Best-effort.
+  void syncConfigToComm(orgConfig);
 }
 
 async function fetchGroupContext(
@@ -881,6 +911,10 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
   st.ownerSyncTimer = setInterval(() => {
     syncOwnerFromCore(orgConfig).catch((e: any) =>
       console.warn(`[openmax] periodic owner-sync failed: ${e?.message}`));
+    // Push local policy to cws-comm after the owner pull, mirroring zylos's
+    // periodicSync which does both on the same 5-min cadence.
+    syncConfigToComm(orgConfig).catch((e: any) =>
+      console.warn(`[openmax] periodic config-sync failed: ${e?.message}`));
   }, OWNER_SYNC_INTERVAL_MS);
   st.ownerSyncTimer.unref?.();
   return st;

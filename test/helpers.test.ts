@@ -6,6 +6,7 @@ import {
   type AccessLike,
   applyConfigEvent,
   buildInboundBody,
+  buildReportedPolicy,
   escapeXml,
   isSkipReply,
   labelMedia,
@@ -137,4 +138,35 @@ test("owner_changed and unknown events are not access mutations", () => {
   assert.equal(applyConfigEvent(a, "agent.config.owner_changed", {}).applied, false);
   assert.equal(applyConfigEvent(a, "agent.config.some_future_event", {}).applied, false);
   assert.deepEqual(a, { dmPolicy: "owner" }); // untouched
+});
+
+// ─── buildReportedPolicy (reverse push payload) ──────────────────────────────
+test("buildReportedPolicy applies zylos defaults for an empty access", () => {
+  assert.deepEqual(buildReportedPolicy({}), {
+    dm_policy: "owner",
+    dm_allowlist: [],
+    group_scope: "allowlist",
+    group_allowlist: [],
+    groups: [],
+  });
+});
+
+test("buildReportedPolicy maps groups to conversation_id/mode/allow_from", () => {
+  const p = buildReportedPolicy({
+    dmPolicy: "allowlist",
+    dmAllowFrom: ["u1"],
+    groupPolicy: "open",
+    groups: {
+      g1: { mode: "smart", allowFrom: ["a", "b"] },
+      g2: {}, // defaults: mode 'mention', allow_from ['*']
+    },
+  });
+  assert.equal(p.dm_policy, "allowlist");
+  assert.deepEqual(p.dm_allowlist, ["u1"]);
+  assert.equal(p.group_scope, "open");
+  assert.deepEqual(p.group_allowlist.sort(), ["g1", "g2"]);
+  const g1 = p.groups.find((g) => g.conversation_id === "g1");
+  const g2 = p.groups.find((g) => g.conversation_id === "g2");
+  assert.deepEqual(g1, { conversation_id: "g1", mode: "smart", allow_from: ["a", "b"] });
+  assert.deepEqual(g2, { conversation_id: "g2", mode: "mention", allow_from: ["*"] });
 });
