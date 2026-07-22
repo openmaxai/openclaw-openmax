@@ -4,7 +4,7 @@ OpenMax (CWS) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw
 
 Part of the OpenMax agent-runtime integration family (`openclaw-openmax`, `hermes-openmax`, `claude-openmax`, `codex-openmax`), built on the shared `@openmaxai/openmax-agent-sdk`.
 
-> **Status: v1.0.0 — verified end-to-end against a live CWS environment** on
+> **Status: v1.1.0 — verified end-to-end against a live CWS environment** on
 > `@openmaxai/openmax-agent-sdk@^1.0.0` (stable) — DM round-trip, owner
 > auto-bind, group mention gating, smart mode, image/file attachments,
 > reply chunking, and disconnect/sync recovery.
@@ -41,7 +41,7 @@ Same two-layer pattern as [openclaw-hxa-connect](https://github.com/coco-xyz/ope
 1. Clone into your OpenClaw extensions directory:
    ```bash
    cd ~/.openclaw/extensions
-   git clone --branch v1.0.0 --depth 1 https://github.com/openmaxai/openclaw-openmax.git openmax
+   git clone --branch v1.1.0 --depth 1 https://github.com/openmaxai/openclaw-openmax.git openmax
    cd openmax
    npm install
    ```
