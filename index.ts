@@ -27,14 +27,16 @@ import {
 // in helpers.ts so they run under `node --test` without the OpenClaw host.
 import {
   type ContextBlocks,
+  EMPTY_RECONCILE_MARKER,
+  type ReconcileMarker,
   applyConfigEvent,
   buildAccessSnapshot,
   buildInboundBody,
-  buildReportedPolicy,
   configWithAccess,
   escapeXml,
   isSkipReply,
   labelMedia,
+  reconcileAgentPolicy,
   resolveQueueModeOverride,
 } from "./helpers.ts";
 
@@ -249,6 +251,15 @@ interface BridgeState {
   orgConfig: any;
   memberNames: Map<string, string>;
   ownerSyncTimer?: ReturnType<typeof setInterval>;
+  /** Debounce handle for the event-driven reconcile. */
+  policyReconcileTimer?: ReturnType<typeof setTimeout>;
+  /** Serializes reconcile rounds so a debounced run and the periodic tick
+   *  cannot interleave two GET/PUT pairs against the same policy. */
+  policyReconcileChain?: Promise<void>;
+  /** What the last completed reconcile saw. Per-bridge and in-memory: a fresh
+   *  bridge starts with an empty marker and therefore takes the server's
+   *  stored policy as authoritative on its first round. */
+  policyMarker: ReconcileMarker;
 }
 
 // Periodic owner + self-display-name pull from cws-core. The event-driven path
@@ -420,29 +431,70 @@ async function syncOwnerFromCore(orgConfig: any): Promise<void> {
   await persistOwner(coreOwnerId, ownerName);
 }
 
-// Reverse-direction policy push. Port of zylos-openmax comm-bridge.js
-// syncConfigToComm (src/comm-bridge.js:1875-1912): PUT the local access policy
-// to cws-comm's /agents/{memberId}/reported-policy so the server reflects
-// offline config.json edits or a fresh install's pre-populated policy. Called
-// from BOTH the periodic tick and the config-change epilogue, matching zylos's
-// two call sites (periodicSync + handleConfigUpdate). A 404 means the endpoint
-// isn't available on this cws-comm — skip quietly, exactly as zylos does.
-async function syncConfigToComm(orgConfig: any): Promise<void> {
-  const st = state;
-  if (!st) return;
+// ─── Policy reconcile with cws-comm (read first, then decide) ────────────────
+// This replaces the unconditional full PUT that zylos-openmax does on its
+// periodic tick (comm-bridge.js syncConfigToComm). That design has no recovery
+// path: cws-comm drops agent.config.* events for an offline agent and never
+// replays them (agent_config_relay.go), so owner edits made while the agent is
+// down never reach it — and the next full PUT then overwrote the server's real
+// values with the agent's stale ones, wiping a populated group_allowlist and
+// deleting its per-group rows.
+//
+// Decision logic and payload shaping are pure and unit-tested in helpers.ts
+// (decideReconcile / reconcileAgentPolicy). This function is only the I/O
+// binding: GET the server policy, then seed / adopt / push / do nothing. There
+// is no route from a failed GET to a PUT.
+async function reconcilePolicyWithComm(st: BridgeState): Promise<void> {
+  const orgConfig = st.orgConfig;
   const selfMemberId = orgConfig?.self?.member_id;
+  // member_id lands on the token exchange (onMemberId); until then there is
+  // nothing to reconcile against — the next tick retries.
   if (!selfMemberId) return;
-  const payload = buildReportedPolicy(orgConfig.access || {});
-  try {
-    await st.http.putForOrg(orgConfig.org_id, st.http.apiPath(`/agents/${selfMemberId}/reported-policy`), payload);
-    console.log(`[openmax] policy reported: dmPolicy=${payload.dm_policy}, groupScope=${payload.group_scope}, groups=${payload.groups.length}`);
-  } catch (err: any) {
-    if (err?.status === 404) {
-      console.warn("[openmax] reported-policy endpoint not available (404), skipping");
-    } else {
-      console.warn(`[openmax] config sync to comm failed: ${err?.message}`);
-    }
-  }
+  if (!orgConfig.access) orgConfig.access = {};
+
+  const outcome = await reconcileAgentPolicy({
+    localAccess: orgConfig.access,
+    marker: st.policyMarker,
+    getServerPolicy: () =>
+      st.http.getForOrg(orgConfig.org_id, st.http.apiPath(`/agents/${selfMemberId}/policy`)),
+    putReportedPolicy: (payload) =>
+      st.http.putForOrg(orgConfig.org_id, st.http.apiPath(`/agents/${selfMemberId}/reported-policy`), payload),
+    adoptAccess: async (access) => {
+      // Live first (decideInbound re-reads orgConfig.access per call), then
+      // durable through the same write path a policy event uses.
+      orgConfig.access = access;
+      await persistAccess(access);
+    },
+    log: (m: string) => console.log(`[openmax] ${m}`),
+    warn: (m: string) => console.warn(`[openmax] ${m}`),
+  });
+  st.policyMarker = outcome.marker;
+}
+
+/** Run reconciles one at a time, in call order. */
+function queuePolicyReconcile(st: BridgeState): Promise<void> {
+  st.policyReconcileChain = (st.policyReconcileChain ?? Promise.resolve())
+    .then(() => reconcilePolicyWithComm(st))
+    .catch((err: any) => console.warn(`[openmax] policy reconcile failed: ${err?.message}`));
+  return st.policyReconcileChain;
+}
+
+// Coalescing window for the event-driven reconcile. The settings page saves one
+// user-visible policy change as SEVERAL sequential writes (e.g. set-group-scope
+// followed by group-allowlist add), each arriving as its own agent.config.*
+// event. Acting on the first event immediately would report a policy that does
+// not yet include the second write, racing the owner's own save.
+const POLICY_RECONCILE_DEBOUNCE_MS = 3_000;
+
+/** Trailing-edge debounce: every event pushes the deadline out, so the round
+ *  always runs after the last event of a burst — none is dropped. */
+function schedulePolicyReconcile(st: BridgeState): void {
+  if (st.policyReconcileTimer) clearTimeout(st.policyReconcileTimer);
+  st.policyReconcileTimer = setTimeout(() => {
+    st.policyReconcileTimer = undefined;
+    void queuePolicyReconcile(st);
+  }, POLICY_RECONCILE_DEBOUNCE_MS);
+  st.policyReconcileTimer.unref?.();
 }
 
 // SDK onConfigEvent seam: the bridge classifies agent.config.* system frames,
@@ -474,10 +526,10 @@ async function handleConfigEvent(orgConfig: any, evt: { event: string; data: any
   // Live effect is already done (mutated orgConfig.access in place). Persist so
   // the edit survives a restart.
   await persistAccess(orgConfig.access);
-  // Immediately report the updated policy back to cws-comm so the server
-  // reflects the change without waiting for the periodic tick (mirrors zylos's
-  // handleConfigUpdate epilogue, comm-bridge.js:1300). Best-effort.
-  void syncConfigToComm(orgConfig);
+  // Reconcile with cws-comm shortly after the burst settles, rather than
+  // pushing our whole policy at the tail of every single event. Best-effort.
+  const st = state;
+  if (st) schedulePolicyReconcile(st);
 }
 
 async function fetchGroupContext(
@@ -906,6 +958,7 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
     comm: new CommService(http),
     orgConfig,
     memberNames: new Map(),
+    policyMarker: EMPTY_RECONCILE_MARKER,
   };
   state = st;
   try {
@@ -918,12 +971,15 @@ async function startBridge(acct: OpenMaxChannelConfig, log: any): Promise<Bridge
   // owner_changed edits; this is the scheduled heal). unref so it never keeps
   // the process alive; cleared in stopBridge.
   st.ownerSyncTimer = setInterval(() => {
-    syncOwnerFromCore(orgConfig).catch((e: any) =>
-      console.warn(`[openmax] periodic owner-sync failed: ${e?.message}`));
-    // Push local policy to cws-comm after the owner pull, mirroring zylos's
-    // periodicSync which does both on the same 5-min cadence.
-    syncConfigToComm(orgConfig).catch((e: any) =>
-      console.warn(`[openmax] periodic config-sync failed: ${e?.message}`));
+    // Reconcile policy with cws-comm AFTER the owner pull, on the same 5-min
+    // cadence. Also the recovery path for edits missed while offline: the
+    // server's stored policy wins whenever we have not seen it before.
+    // Sequential, not parallel — persistOwner and persistAccess each
+    // read-modify-write the whole config file, so overlapping rounds could drop
+    // one of the two fields.
+    syncOwnerFromCore(orgConfig)
+      .catch((e: any) => console.warn(`[openmax] periodic owner-sync failed: ${e?.message}`))
+      .then(() => queuePolicyReconcile(st));
   }, OWNER_SYNC_INTERVAL_MS);
   st.ownerSyncTimer.unref?.();
   return st;
@@ -939,6 +995,10 @@ async function stopBridge(target?: BridgeState): Promise<void> {
   if (st.ownerSyncTimer) {
     clearInterval(st.ownerSyncTimer);
     st.ownerSyncTimer = undefined;
+  }
+  if (st.policyReconcileTimer) {
+    clearTimeout(st.policyReconcileTimer);
+    st.policyReconcileTimer = undefined;
   }
   try {
     await st.bridge.stop();
