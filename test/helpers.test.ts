@@ -5,8 +5,10 @@ import {
   SMART_MODE_HINT,
   type AccessLike,
   applyConfigEvent,
+  buildAccessSnapshot,
   buildInboundBody,
   buildReportedPolicy,
+  configWithAccess,
   escapeXml,
   isSkipReply,
   labelMedia,
@@ -169,4 +171,54 @@ test("buildReportedPolicy maps groups to conversation_id/mode/allow_from", () =>
   const g2 = p.groups.find((g) => g.conversation_id === "g2");
   assert.deepEqual(g1, { conversation_id: "g1", mode: "smart", allow_from: ["a", "b"] });
   assert.deepEqual(g2, { conversation_id: "g2", mode: "mention", allow_from: ["*"] });
+});
+
+// ─── Config-snapshot ownership (regression guard) ────────────────────────────
+// The bug this pins: buildOrgConfig used to store openclaw's live
+// `channels.openmax.access` reference, so applyConfigEvent mutated the very
+// snapshot the config writer diffs against. Live delivery worked, the write was
+// a no-op, and the new group was gone after a restart. Reverting the copy inside
+// buildAccessSnapshot must turn this test red.
+test("a policy event never mutates openclaw's config snapshot, and the persisted config carries the change", () => {
+  // Shape of openclaw's runtime config snapshot; channels.openmax.access is
+  // what resolveOpenMaxConfig(ctx.cfg) hands the plugin.
+  const runtimeSnapshot: any = {
+    meta: { lastTouchedAt: "2026-08-27T12:00:00.000Z" },
+    channels: { openmax: { orgId: "org-1", access: { groupPolicy: "allowlist", groups: {} } } },
+  };
+  const acctAccess = runtimeSnapshot.channels.openmax.access;
+
+  // What buildOrgConfig() stores as orgConfig.access.
+  const orgAccess = buildAccessSnapshot(acctAccess);
+
+  const res = applyConfigEvent(orgAccess, "agent.config.group_allowlist_changed", {
+    action: "add",
+    conversation_ids: ["g-new"],
+  });
+  assert.equal(res.applied, true);
+  assert.deepEqual(Object.keys(orgAccess.groups || {}), ["g-new"]); // live effect for decideInbound
+
+  // 1. The write path's diff base is untouched — this is what made the merge
+  //    patch empty and the persist a silent no-op.
+  assert.deepEqual(acctAccess, { groupPolicy: "allowlist", groups: {} });
+  assert.deepEqual(runtimeSnapshot.channels.openmax.access, { groupPolicy: "allowlist", groups: {} });
+  assert.notEqual(orgAccess, acctAccess); // a copy, not the live reference
+
+  // 2. What we hand writeConfigFile() carries the new group, and differs from
+  //    the snapshot — i.e. the diff against it cannot come out empty.
+  const written = configWithAccess(runtimeSnapshot, orgAccess);
+  assert.deepEqual(Object.keys(written.channels.openmax.access.groups), ["g-new"]);
+  assert.notDeepEqual(written.channels.openmax.access, runtimeSnapshot.channels.openmax.access);
+  // Unrelated config is preserved, and neither side shares structure with it.
+  assert.equal(written.channels.openmax.orgId, "org-1");
+  assert.equal(written.meta.lastTouchedAt, "2026-08-27T12:00:00.000Z");
+  assert.notEqual(written, runtimeSnapshot);
+  assert.notEqual(written.channels.openmax.access, orgAccess);
+
+  // 3. A later live mutation cannot reach the object already handed to the writer.
+  applyConfigEvent(orgAccess, "agent.config.group_allowlist_changed", {
+    action: "add",
+    conversation_ids: ["g-later"],
+  });
+  assert.deepEqual(Object.keys(written.channels.openmax.access.groups), ["g-new"]);
 });

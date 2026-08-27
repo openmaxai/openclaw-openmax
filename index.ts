@@ -28,8 +28,10 @@ import {
 import {
   type ContextBlocks,
   applyConfigEvent,
+  buildAccessSnapshot,
   buildInboundBody,
   buildReportedPolicy,
+  configWithAccess,
   escapeXml,
   isSkipReply,
   labelMedia,
@@ -59,8 +61,10 @@ function getDataDir(): string {
 }
 
 // ─── Types ───────────────────────────────────────────────────
-// Access-policy semantics live in the SDK (decideInbound); this config is
-// handed to it verbatim as orgConfig.access — see docs/design.md.
+// Access-policy semantics live in the SDK (decideInbound), which reads this
+// config as orgConfig.access. The plugin holds its OWN deep copy of the record
+// (buildAccessSnapshot) — the object in openclaw's config is that write path's
+// diff base and must not move under it. See docs/design.md.
 interface OpenMaxGroupConfig {
   name?: string;
   allowFrom?: string[];
@@ -309,18 +313,16 @@ async function persistOwner(memberId: string, name: string): Promise<void> {
 
 // Persist the access policy (dmPolicy/dmAllowFrom/groupPolicy/groups) to
 // config.json. Mirrors persistOwner: clone the LIVE shared snapshot before
-// mutating so a failed write can't corrupt other consumers. Called after an
-// agent.config.* access event has already mutated the live orgConfig.access
-// (which the SDK's decideInbound gate reads) — this makes the edit survive a
-// restart; the live mutation is what makes it take effect immediately.
+// mutating so a failed write can't corrupt other consumers, and never hand the
+// writer an object that shares structure with its own diff base. Called after
+// an agent.config.* access event (or a server adoption) has already updated the
+// live orgConfig.access that the SDK's decideInbound gate reads — this makes the
+// edit survive a restart; the live update is what makes it take effect now.
 async function persistAccess(access: OpenMaxAccessConfig): Promise<void> {
   const runtime = getRuntime() as any;
   try {
     const loaded = runtime.config.current?.() ?? (await runtime.config.loadConfig());
-    const cfg = structuredClone(loaded ?? {});
-    const openmax = ((cfg.channels ||= {}).openmax ||= {});
-    openmax.access = structuredClone(access);
-    await runtime.config.writeConfigFile(cfg);
+    await runtime.config.writeConfigFile(configWithAccess(loaded, access));
   } catch (err: any) {
     console.error(`[openmax] access persist failed: ${err?.message}`);
   }
@@ -445,8 +447,11 @@ async function syncConfigToComm(orgConfig: any): Promise<void> {
 
 // SDK onConfigEvent seam: the bridge classifies agent.config.* system frames,
 // applies the "not for us" target check, and hands us { event, data }. We mutate
-// the SAME orgConfig object the SDK's decideInbound gate reads (live effect,
-// no restart) and persist for durability. owner_changed is routed to
+// the orgConfig record the SDK's decideInbound gate reads (live effect, no
+// restart) and persist for durability. That record is the plugin's own copy —
+// decideInbound re-reads orgConfig.access on every call, so mutating it in place
+// is still immediate, while openclaw's config snapshot stays untouched so the
+// persist actually produces a diff. owner_changed is routed to
 // syncOwnerFromCore; the six access events go through the pure applyConfigEvent.
 async function handleConfigEvent(orgConfig: any, evt: { event: string; data: any }): Promise<void> {
   const { event, data } = evt;
@@ -744,7 +749,11 @@ function buildOrgConfig(acct: OpenMaxChannelConfig): any {
       ...(acct.agentName ? { display_name: acct.agentName, name: acct.agentName } : {}),
     },
     owner: acct.owner?.memberId ? { member_id: acct.owner.memberId, name: acct.owner.name || "" } : {},
-    access: acct.access || {},
+    // Deep copy, NOT the live reference from openclaw's runtime config
+    // snapshot: applyConfigEvent mutates this record in place, and the config
+    // writer diffs against that same snapshot — sharing it makes every persist
+    // a silent no-op (see buildAccessSnapshot in helpers.ts).
+    access: buildAccessSnapshot(acct.access),
   };
 }
 

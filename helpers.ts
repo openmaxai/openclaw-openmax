@@ -235,3 +235,30 @@ export function buildReportedPolicy(access: AccessLike): ReportedPolicyPayload {
     groups,
   };
 }
+
+// ─── Config-snapshot ownership (the openclaw write path's diff base) ─────────
+// OpenClaw's config writer computes `applyMergePatch(sourceSnapshot,
+// createMergePatch(runtimeSnapshot, cfg))` — the RUNTIME snapshot is the diff
+// base. `resolveOpenMaxConfig(ctx.cfg).access` is a live reference INTO that
+// snapshot, so mutating it in place also moves the diff base: the patch comes
+// out empty and the write silently persists nothing (observed: identical byte
+// count before/after, only `meta.lastTouchedAt` changed, and the new group gone
+// after a restart). The plugin therefore owns its own copy of the access record
+// from the moment it builds the org config.
+
+/** Deep-copy the account's access record so later in-place mutations
+ *  (applyConfigEvent) cannot reach openclaw's runtime config snapshot. */
+export function buildAccessSnapshot(access?: AccessLike | null): AccessLike {
+  return structuredClone(access || {});
+}
+
+/** Shape the object handed to openclaw's `writeConfigFile`: a deep copy of the
+ *  loaded config with `channels.openmax.access` replaced by a deep copy of
+ *  `access`. Copying both sides keeps the caller's snapshot usable as a diff
+ *  base and keeps the written object independent of later live mutations. */
+export function configWithAccess(loadedConfig: any, access: AccessLike): any {
+  const cfg = structuredClone(loadedConfig ?? {});
+  const openmax = ((cfg.channels ||= {}).openmax ||= {});
+  openmax.access = structuredClone(access);
+  return cfg;
+}
