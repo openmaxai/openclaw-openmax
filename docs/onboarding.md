@@ -15,7 +15,7 @@ registration is an explicit curl step (the plugin has no auto-register).
 ```bash
 # Normal install (auto-discovered from the extensions dir):
 mkdir -p ~/.openclaw/extensions
-git clone --branch v1.1.0 --depth 1 https://github.com/openmaxai/openclaw-openmax.git openmax
+git clone --branch v1.2.0 --depth 1 https://github.com/openmaxai/openclaw-openmax.git openmax
 cd openmax && npm install
 
 # Local development alternative: skip the clone and point config at a checkout
