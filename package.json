@@ -19,7 +19,7 @@
   ],
   "author": "Coco AI (https://github.com/coco-xyz)",
   "dependencies": {
-    "@openmaxai/openmax-agent-sdk": "^1.0.0"
+    "@openmaxai/openmax-agent-sdk": "^1.0.3"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test \"test/*.test.ts\""
